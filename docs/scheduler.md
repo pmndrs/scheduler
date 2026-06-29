@@ -54,19 +54,22 @@ const { scheduler } = useFrame()
 
 ---
 
-## Independent mode
+## Standalone (no host)
 
-Run the scheduler without any host (no Canvas, no renderer).
-
-### `independent` (getter/setter)
+Run the scheduler without any host (no Canvas, no renderer) — **no setup required**. The
+first `register` (or `useFrame`) lazily creates an internal **ambient root**:
 
 ```ts
-getScheduler().independent = true
+getScheduler().register((state, delta) => {
+  // state = { time, delta, elapsed, frame }
+})
 ```
 
-- When set to `true`, a default root is created automatically.
+- The ambient root is created on demand; you never reference it directly.
 - Callbacks receive timing-only [`FrameTimingState`](#type-definitions): `{ time, delta, elapsed, frame }`.
 - Useful for game loops, animations, or any frame-based logic with no renderer.
+- If a host registers later, it **adopts** these jobs. See
+  [Ambient root & host adoption](./design/ambient-root.md).
 
 ---
 
@@ -86,6 +89,10 @@ if (scheduler.isReady) {
 
 Subscribe to be notified when a root becomes available. Fires immediately if one already
 exists. Returns an unsubscribe function.
+
+> Note: this signals "a root exists" — which includes the lazily-created **ambient root**,
+> so it fires on the first `register` even with no host attached. It is not a "host state
+> ready" signal.
 
 ```ts
 const unsub = scheduler.onRootReady(() => {
@@ -138,7 +145,8 @@ console.log(scheduler.phases)
 ## Root management
 
 A **root** is a container for jobs. react-three-fiber registers one root per `<Canvas>`;
-standalone you create one via `independent = true` or `registerRoot`.
+standalone, an ambient root is created lazily on first `register` (or call `registerRoot`
+explicitly for multi-root setups).
 
 ### `registerRoot(id, options?)`
 
@@ -432,8 +440,7 @@ describe('animation system', () => {
   beforeEach(() => {
     Scheduler.reset() // fresh singleton
     scheduler = getScheduler()
-    scheduler.independent = true
-    scheduler.frameloop = 'never'
+    scheduler.frameloop = 'never' // drive frames manually; register() creates the root
   })
 
   afterEach(() => Scheduler.reset())

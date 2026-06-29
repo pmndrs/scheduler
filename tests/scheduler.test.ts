@@ -457,9 +457,11 @@ describe('Scheduler', () => {
   })
 })
 
-//* Independent Mode Tests ==============================
+//* Standalone (hostless) State ==============================
+// Lazy ambient-root behavior is covered in "Ambient root & host adoption"; this
+// pins the exact shape of the timing-only state a hostless job receives.
 
-describe('Scheduler Independent Mode', () => {
+describe('Scheduler standalone state', () => {
   beforeEach(() => {
     Scheduler.reset()
   })
@@ -468,32 +470,11 @@ describe('Scheduler Independent Mode', () => {
     Scheduler.reset()
   })
 
-  it('runs callbacks immediately without a host when independent=true', () => {
+  it('provides timing-only state with no host props', () => {
     const scheduler = Scheduler.get()
-    scheduler.independent = true
-    scheduler.frameloop = 'never'
-
-    const calls: number[] = []
-
-    scheduler.register((state) => {
-      calls.push(state.frame)
-    })
-
-    // Should have a default root now
-    expect(scheduler.getRootCount()).toBe(1)
-
-    // Manual step should work
-    scheduler.step(1000)
-    expect(calls.length).toBe(1)
-  })
-
-  it('provides timing-only state in independent mode', () => {
-    const scheduler = Scheduler.get()
-    scheduler.independent = true
     scheduler.frameloop = 'never'
 
     let receivedState: any
-
     scheduler.register((state) => {
       receivedState = state
     })
@@ -510,16 +491,6 @@ describe('Scheduler Independent Mode', () => {
     expect(receivedState.gl).toBeUndefined()
     expect(receivedState.scene).toBeUndefined()
     expect(receivedState.camera).toBeUndefined()
-  })
-
-  it('creates default root automatically when independent mode is set', () => {
-    const scheduler = Scheduler.get()
-
-    expect(scheduler.getRootCount()).toBe(0)
-
-    scheduler.independent = true
-
-    expect(scheduler.getRootCount()).toBe(1)
   })
 })
 
@@ -684,5 +655,227 @@ describe('Scheduler Error Handling', () => {
 
     expect(errors.length).toBe(1)
     expect(errors[0].message).toBe('Manual error')
+  })
+})
+
+//* Ambient Root & Host Adoption ==============================
+// @see docs/design/ambient-root.md
+
+describe('Ambient root & host adoption', () => {
+  const AMBIENT_ID = Scheduler.AMBIENT_ID
+
+  beforeEach(() => {
+    Scheduler.reset()
+  })
+
+  afterEach(() => {
+    Scheduler.reset()
+  })
+
+  //* Lazy ambient root --------------------------------
+
+  it('register() with no host lazily creates the ambient root and runs the job', () => {
+    const scheduler = Scheduler.get()
+    scheduler.frameloop = 'never'
+
+    expect(scheduler.getRootCount()).toBe(0)
+
+    const calls: number[] = []
+    scheduler.register((state) => calls.push(state.frame))
+
+    expect(scheduler.getRootCount()).toBe(1)
+    expect(scheduler.getJobCount()).toBe(1)
+
+    scheduler.step(1000)
+    expect(calls.length).toBe(1)
+  })
+
+  it('ambient job receives timing-only ({}) state before any host attaches', () => {
+    const scheduler = Scheduler.get()
+    scheduler.frameloop = 'never'
+
+    let received: any
+    scheduler.register((state) => {
+      received = state
+    })
+    scheduler.step(1000)
+
+    expect(received).toHaveProperty('frame')
+    expect(received.camera).toBeUndefined()
+    expect(received.gl).toBeUndefined()
+  })
+
+  it('does not warn when registering without a host', () => {
+    const scheduler = Scheduler.get()
+    scheduler.frameloop = 'never'
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+
+    scheduler.register(() => {})
+
+    expect(warn).not.toHaveBeenCalled()
+    warn.mockRestore()
+  })
+
+  it('still warns and no-ops for an explicit rootId that does not exist', () => {
+    const scheduler = Scheduler.get()
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+
+    scheduler.register(() => {}, { rootId: 'nope' })
+
+    expect(warn).toHaveBeenCalled()
+    expect(scheduler.getJobCount()).toBe(0)
+    warn.mockRestore()
+  })
+
+  it('starts the loop on the first ambient job (frameloop=always)', () => {
+    const scheduler = Scheduler.get()
+    expect(scheduler.isRunning).toBe(false)
+
+    scheduler.register(() => {})
+
+    expect(scheduler.isRunning).toBe(true)
+  })
+
+  //* Host adoption --------------------------------
+
+  it('first host adopts ambient orphan jobs, preserving id and phase', () => {
+    const scheduler = Scheduler.get()
+    scheduler.frameloop = 'never'
+
+    scheduler.register(() => {}, { id: 'orphan', phase: 'render' })
+    expect(scheduler.getRootCount()).toBe(1)
+
+    scheduler.registerRoot('host', { getState: () => ({ camera: 'cam' }) })
+
+    // Ambient gone, host is the sole root, job preserved
+    expect(scheduler.getRootCount()).toBe(1)
+    expect(scheduler.getJobIds()).toEqual(['orphan'])
+    expect(scheduler.hasUserJobsInPhase('render', 'host')).toBe(true)
+  })
+
+  it('removes the ambient root after adoption', () => {
+    const scheduler = Scheduler.get()
+    scheduler.frameloop = 'never'
+
+    scheduler.register(() => {}, { id: 'orphan' })
+    scheduler.registerRoot('host', { getState: () => ({}) })
+
+    expect(scheduler.hasUserJobsInPhase('update', AMBIENT_ID)).toBe(false)
+    expect(scheduler.getRootCount()).toBe(1)
+  })
+
+  it('delivers host state to adopted jobs (and {} before adoption)', () => {
+    const scheduler = Scheduler.get()
+    scheduler.frameloop = 'never'
+
+    const seen: any[] = []
+    scheduler.register((state: any) => seen.push(state.camera), { id: 'orphan' })
+
+    scheduler.step(1000)
+    expect(seen[seen.length - 1]).toBeUndefined() // pre-adoption: no host state
+
+    scheduler.registerRoot('host', { getState: () => ({ camera: 'cam' }) })
+    scheduler.step(2000)
+    expect(seen[seen.length - 1]).toBe('cam') // post-adoption: host state
+  })
+
+  it('preserves fps throttle state across adoption', () => {
+    const scheduler = Scheduler.get()
+    scheduler.frameloop = 'never'
+
+    let runs = 0
+    scheduler.register(() => runs++, { id: 'throttled', fps: 30, drop: true })
+
+    scheduler.step(1000) // runs (first call), sets lastRun = 1000
+    expect(runs).toBe(1)
+
+    scheduler.registerRoot('host', { getState: () => ({}) })
+
+    // Only ~1ms later: still throttled (lastRun migrated with the job)
+    scheduler.step(1001)
+    expect(runs).toBe(1)
+
+    // Past the 1/30s interval: runs again
+    scheduler.step(1100)
+    expect(runs).toBe(2)
+  })
+
+  it('preserves pause state and job-state listeners across adoption', () => {
+    const scheduler = Scheduler.get()
+    scheduler.frameloop = 'never'
+
+    scheduler.register(() => {}, { id: 'pausable' })
+    scheduler.pauseJob('pausable')
+    expect(scheduler.isJobPaused('pausable')).toBe(true)
+
+    let notified = 0
+    scheduler.subscribeJobState('pausable', () => notified++)
+
+    scheduler.registerRoot('host', { getState: () => ({}) })
+
+    // Pause state survived the migration
+    expect(scheduler.isJobPaused('pausable')).toBe(true)
+    // Listener (keyed by job id) survived and still fires
+    scheduler.resumeJob('pausable')
+    expect(notified).toBe(1)
+    expect(scheduler.isJobPaused('pausable')).toBe(false)
+  })
+
+  it('does NOT adopt jobs registered with an explicit rootId', () => {
+    const scheduler = Scheduler.get()
+    scheduler.frameloop = 'never'
+
+    scheduler.registerRoot('owned', { getState: () => ({}) })
+    scheduler.register(() => {}, { id: 'pinned', rootId: 'owned' })
+
+    // A second host registers; ambient never existed, nothing to adopt
+    scheduler.registerRoot('host2', { getState: () => ({}) })
+
+    expect(scheduler.hasUserJobsInPhase('update', 'owned')).toBe(true)
+    expect(scheduler.hasUserJobsInPhase('update', 'host2')).toBe(false)
+  })
+
+  it('only the first host adopts; a second host adopts nothing', () => {
+    const scheduler = Scheduler.get()
+    scheduler.frameloop = 'never'
+
+    scheduler.register(() => {}, { id: 'orphan' })
+    scheduler.registerRoot('host1', { getState: () => ({}) })
+    scheduler.registerRoot('host2', { getState: () => ({}) })
+
+    expect(scheduler.getRootCount()).toBe(2)
+    expect(scheduler.hasUserJobsInPhase('update', 'host1')).toBe(true)
+    expect(scheduler.hasUserJobsInPhase('update', 'host2')).toBe(false)
+  })
+
+  it('adoption does not trip the loop-stop / error-handler teardown', () => {
+    const scheduler = Scheduler.get() // frameloop defaults to 'always'
+
+    scheduler.register(() => {}, { id: 'orphan' })
+    expect(scheduler.isRunning).toBe(true)
+
+    const errors: Error[] = []
+    scheduler.registerRoot('host', { getState: () => ({}), onError: (e) => errors.push(e) })
+
+    // Loop kept running through adoption...
+    expect(scheduler.isRunning).toBe(true)
+    // ...and the host's error handler is bound (not cleared by ambient teardown)
+    scheduler.triggerError(new Error('boom'))
+    expect(errors.map((e) => e.message)).toEqual(['boom'])
+  })
+
+  it('preserves custom phases on adopted jobs', () => {
+    const scheduler = Scheduler.get()
+    scheduler.frameloop = 'never'
+
+    scheduler.addPhase('ai', { after: 'physics', before: 'update' })
+    const order: string[] = []
+    scheduler.register(() => order.push('ai'), { id: 'ai-job', phase: 'ai' })
+    scheduler.register(() => order.push('update'), { id: 'update-job', phase: 'update' })
+
+    scheduler.registerRoot('host', { getState: () => ({}) })
+    scheduler.step(1000)
+
+    expect(order).toEqual(['ai', 'update'])
   })
 })

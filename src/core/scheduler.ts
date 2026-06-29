@@ -63,6 +63,12 @@ export class Scheduler {
   // share ONE global scheduler instance regardless of how they import it.
   private static readonly INSTANCE_KEY = Symbol.for('@pmndrs/scheduler')
 
+  //* Ambient (hostless) Root ==============================
+  // Reserved id for the lazily-created root that standalone jobs attach to when
+  // no host has registered yet. A host adopts these jobs when it registers.
+  // @see docs/design/ambient-root.md
+  static readonly AMBIENT_ID = '__default__'
+
   private static get instance(): Scheduler | null {
     return (globalThis as any)[Scheduler.INSTANCE_KEY] ?? null
   }
@@ -133,9 +139,8 @@ export class Scheduler {
   private pendingFrames: number = 0
   private _frameloop: Frameloop = 'always'
 
-  //* Independent Mode & Error Handling State ================================
+  //* Error Handling & Root-Ready State ================================
 
-  private _independent: boolean = false
   private errorHandler: ((error: Error) => void) | null = null
   private rootReadyCallbacks: Set<() => void> = new Set()
 
@@ -164,15 +169,6 @@ export class Scheduler {
 
   get isReady(): boolean {
     return this.roots.size > 0
-  }
-
-  get independent(): boolean {
-    return this._independent
-  }
-
-  set independent(value: boolean) {
-    this._independent = value
-    if (value) this.ensureDefaultRoot()
   }
 
   //* Constructor ================================
@@ -220,7 +216,49 @@ export class Scheduler {
       if (this._frameloop === 'always') this.start()
     }
 
+    // Host adoption: the first non-ambient root to register adopts any orphan
+    // jobs accumulated on the ambient root (e.g. a useFrame child whose layout
+    // effect ran before its host's). Runs after the size check above so that
+    // check reflects the pre-adoption count.
+    // @see docs/design/ambient-root.md
+    if (id !== Scheduler.AMBIENT_ID) {
+      this.adoptAmbientOrphans(entry)
+    }
+
     return () => this.unregisterRoot(id)
+  }
+
+  /**
+   * Migrate orphan jobs from the ambient root into a newly registered host root,
+   * then drop the now-empty ambient root. Preserves job identity and all per-job
+   * state (id, phase/order, fps throttle via `job.lastRun`, pause state, and
+   * `jobStateListeners`, which are keyed by job id) — only the owning root changes.
+   *
+   * Sequenced so `roots.size` never hits 0 (the host root is already added),
+   * avoiding the loop-stop / error-handler-clear teardown in `unregisterRoot`.
+   * @param {RootEntry} hostRoot - The root adopting the orphan jobs.
+   * @returns {void}
+   * @private
+   * @see docs/design/ambient-root.md
+   */
+  private adoptAmbientOrphans(hostRoot: RootEntry): void {
+    const ambient = this.roots.get(Scheduler.AMBIENT_ID)
+    if (!ambient || ambient === hostRoot) return
+
+    // Move each orphan job to the host root, preserving id and per-job state.
+    for (const [jobId, job] of ambient.jobs) {
+      if (hostRoot.jobs.has(jobId)) {
+        console.warn(`[Scheduler] Job id "${jobId}" already on host root; keeping host job.`)
+        continue
+      }
+      hostRoot.jobs.set(jobId, job)
+    }
+    if (ambient.jobs.size > 0) hostRoot.needsRebuild = true
+
+    // Clear ambient's jobs BEFORE unregister so its teardown doesn't delete the
+    // jobStateListeners we just migrated, then drop the now-empty ambient root.
+    ambient.jobs.clear()
+    this.unregisterRoot(Scheduler.AMBIENT_ID)
   }
 
   /**
@@ -251,9 +289,14 @@ export class Scheduler {
   }
 
   /**
-   * Subscribe to be notified when a root becomes available.
-   * Fires immediately if a root already exists.
-   * @param {() => void} callback - Function called when first root registers
+   * Subscribe to be notified when a root becomes available. Fires immediately if
+   * a root already exists.
+   *
+   * Note: under the ambient-root model this signals "a root exists" — which now
+   * includes the lazily-created ambient root, so it fires on the first
+   * `register()` even when no host has attached. It is not a "host state ready"
+   * signal. @see docs/design/ambient-root.md
+   * @param {() => void} callback - Function called when the first root registers
    * @returns {() => void} Unsubscribe function
    */
   onRootReady(callback: () => void): () => void {
@@ -283,14 +326,16 @@ export class Scheduler {
   }
 
   /**
-   * Ensure a default root exists for independent mode.
-   * Creates a minimal root with no state provider.
+   * Ensure the ambient (hostless) root exists so standalone usage works with no
+   * setup. Creates a minimal root with an empty state provider; a host adopts
+   * its jobs when it registers.
    * @returns {void}
    * @private
+   * @see docs/design/ambient-root.md
    */
-  private ensureDefaultRoot(): void {
-    if (!this.roots.has('__default__')) {
-      this.registerRoot('__default__')
+  private ensureAmbientRoot(): void {
+    if (!this.roots.has(Scheduler.AMBIENT_ID)) {
+      this.registerRoot(Scheduler.AMBIENT_ID)
     }
   }
 
@@ -412,14 +457,26 @@ export class Scheduler {
     callback: FrameCallback<T>,
     options: JobOptions & { rootId?: string; system?: boolean } = {},
   ): () => void {
-    // Find the root - use provided rootId or find first root
+    // Find the root - use provided rootId or the first registered root.
     const rootId = options.rootId
-    const root = rootId ? this.roots.get(rootId) : this.roots.values().next().value
+    let root = rootId ? this.roots.get(rootId) : this.roots.values().next().value
 
     if (!root) {
-      console.warn('[Scheduler] No root registered. Is this inside a Canvas?')
-      return () => {}
+      // An explicit rootId that doesn't exist is a caller error — don't silently
+      // create an ambient root under the wrong id.
+      if (rootId) {
+        console.warn(`[Scheduler] Root "${rootId}" not found; job not registered.`)
+        return () => {}
+      }
+      // No host yet: lazily create the ambient root so standalone usage needs no
+      // setup. A host that registers later adopts these jobs.
+      // @see docs/design/ambient-root.md
+      this.ensureAmbientRoot()
+      root = this.roots.get(Scheduler.AMBIENT_ID)
     }
+
+    // Guaranteed past this point; satisfies the type narrower.
+    if (!root) return () => {}
 
     const id = options.id ?? this.generateJobId()
 

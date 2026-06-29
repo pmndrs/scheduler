@@ -83,7 +83,7 @@ export type FrameNextCallback = FrameCallback
 
 /** Options for `scheduler.registerRoot` */
 export interface RootOptions {
-  /** State provider for callbacks. Optional in independent mode. */
+  /** State provider for callbacks. Optional for hostless (standalone) roots. */
   getState?: () => any
   /** Error handler for job errors. Falls back to console.error if not provided. */
   onError?: (error: Error) => void
@@ -150,7 +150,6 @@ export interface SchedulerApi {
   stop(): void
   readonly isRunning: boolean
   frameloop: Frameloop
-  independent: boolean
 
   //* Manual Stepping
   step(timestamp?: number): void
@@ -249,7 +248,7 @@ export interface FrameLoopState {
 export interface RootEntry {
   /** Unique identifier for this root */
   id: string
-  /** Function to get the root's current state. Returns any to support independent mode. */
+  /** Function to get the root's current state. Returns any to support hostless roots. */
   getState: () => any
   /** Map of job IDs to Job objects */
   jobs: Map<string, Job>

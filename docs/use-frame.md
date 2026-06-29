@@ -31,29 +31,20 @@ function Spinner() {
 
 ## Registration timing
 
-The hook needs a **root** to register against. There are three situations:
+Registration is **immediate and needs no setup** — `useFrame` always has a root to attach
+to. There are two situations:
 
 ### A host is present (e.g. react-three-fiber)
 
-When something has already registered a root, the job registers immediately and receives
-that host's injected state merged with timing.
+When a host has registered a root, the job registers against it and receives that host's
+injected state merged with timing.
 
-### Waiting for a host
+### No host (standalone), or a host that mounts later
 
-If no root exists yet, `useFrame` waits and registers as soon as the first root mounts.
-This lets UI components outside a `<Canvas>` schedule work that "attaches" once the canvas
-is up.
-
-### Independent mode (no host)
-
-For standalone apps, enable independent mode once at startup. A default root is created and
-callbacks fire with timing-only state:
+With no host, the job attaches to the scheduler's lazily-created **ambient root** and fires
+with timing-only state. No flag or startup call is required:
 
 ```tsx
-import { getScheduler } from '@pmndrs/scheduler'
-
-getScheduler().independent = true
-
 function GameLoop() {
   useFrame((state, delta) => {
     updateGame(delta) // state = { time, delta, elapsed, frame }
@@ -61,6 +52,12 @@ function GameLoop() {
   return null
 }
 ```
+
+If a host registers _later_ — which happens in react-three-fiber, since React fires a
+child's `useFrame` effect before the parent `<Canvas>`'s root registration — the host
+**adopts** the already-registered job, and it begins receiving host state on the next frame.
+You never wait or coordinate; ordering is handled for you.
+See [Ambient root & host adoption](./design/ambient-root.md).
 
 ### Scheduler access only
 

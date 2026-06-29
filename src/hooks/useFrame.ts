@@ -15,10 +15,10 @@ import type { FrameCallback, FrameTimingState, UseFrameOptions, FrameControls } 
  * inject their own state through a root's `getState` can type it via the generic:
  * `useFrame<MyState>((state, delta) => ...)`.
  *
- * Registration waits for a root to be available:
- * - If a root is already registered (or the scheduler is in `independent` mode), the
- *   job registers immediately.
- * - Otherwise it waits for the first root via `scheduler.onRootReady`.
+ * Registration is immediate and needs no setup: if no host has registered, the
+ * job attaches to the scheduler's lazily-created ambient root. If a host (e.g. a
+ * `<Canvas>`) registers later — React fires child effects before the parent's —
+ * it adopts the job. @see docs/design/ambient-root.md
  *
  * Returns a controls object for manual stepping, pausing, and resuming.
  *
@@ -31,8 +31,7 @@ import type { FrameCallback, FrameTimingState, UseFrameOptions, FrameControls } 
  * useFrame((state, delta) => { ... }, { phase: 'physics' })
  *
  * @example
- * // Independent mode - no host renderer needed
- * getScheduler().independent = true
+ * // Standalone - no host renderer needed, no setup
  * useFrame((state, delta) => { updateGame(delta) })
  *
  * @example
@@ -82,27 +81,15 @@ export function useFrame<T = FrameTimingState>(
     // Skip registration if no callback - user just wants scheduler access
     if (!callback) return
 
-    const register = () =>
-      scheduler.register((state, delta) => callbackRef.current?.(state as T & FrameTimingState, delta), {
-        id,
-        ...options,
-      })
-
-    // Independent mode or a root already exists: register now
-    if (scheduler.independent || scheduler.isReady) {
-      return register()
-    }
-
-    // Wait for a root to register
-    let unregisterJob: (() => void) | null = null
-    const unsubReady = scheduler.onRootReady(() => {
-      unregisterJob = register()
+    // Register immediately. Under the ambient-root model the scheduler always has
+    // a root to attach to (the ambient root is created lazily here if none
+    // exists). If this effect runs before a host's — React fires child effects
+    // before parent — the host adopts this job when it registers. No waiting.
+    // @see docs/design/ambient-root.md
+    return scheduler.register((state, delta) => callbackRef.current?.(state as T & FrameTimingState, delta), {
+      id,
+      ...options,
     })
-
-    return () => {
-      unsubReady()
-      unregisterJob?.()
-    }
     // Note: `callback` intentionally excluded - useMutableCallback handles updates
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [scheduler, id, optionsKey])

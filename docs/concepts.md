@@ -57,7 +57,6 @@ scheduler computes the execution order. No more guessing with priority numbers.
 import { getScheduler } from '@pmndrs/scheduler'
 
 const scheduler = getScheduler()
-scheduler.independent = true // run without a host renderer
 
 // Input handling runs first
 scheduler.register(processInput, { phase: 'input' })
@@ -83,9 +82,10 @@ useFrame(updateGameState, { phase: 'update' })
 useFrame(recordStats, { phase: 'finish' })
 ```
 
-> **Roots.** Jobs live under a **root**. In react-three-fiber each `<Canvas>` registers a
-> root for you. Standalone, you either flip `scheduler.independent = true` (creates a
-> default root) or call `scheduler.registerRoot(id)` yourself. See the
+> **Roots.** Jobs live under a **root**. Standalone you don't manage this: the first
+> `register` (or `useFrame`) lazily creates an ambient root. In react-three-fiber each
+> `<Canvas>` registers its own root and **adopts** any jobs already registered. You can also
+> call `scheduler.registerRoot(id)` yourself for explicit multi-root setups. See the
 > [Scheduler reference](./scheduler.md#root-management).
 
 ## What this fixes
@@ -256,7 +256,6 @@ Putting it together (vanilla):
 
 ```ts
 const scheduler = getScheduler()
-scheduler.independent = true
 
 // Custom AI phase between physics and update
 scheduler.addPhase('ai', { after: 'physics', before: 'update' })

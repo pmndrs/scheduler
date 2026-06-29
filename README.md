@@ -34,7 +34,6 @@ React is an optional peer dependency, only needed for the `/react` entry.
 import { getScheduler } from '@pmndrs/scheduler'
 
 const scheduler = getScheduler()
-scheduler.independent = true // run without a host renderer
 
 scheduler.register(
   (state, delta) => {
@@ -43,6 +42,10 @@ scheduler.register(
   { phase: 'update' },
 )
 ```
+
+No host renderer or setup flag is required — registering a job lazily creates the
+scheduler's root and starts the loop. If a host (e.g. a `<Canvas>`) registers later, it
+adopts jobs already registered.
 
 ## React
 
