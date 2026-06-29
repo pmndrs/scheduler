@@ -1,0 +1,17 @@
+{
+  "compilerOptions": {
+    "target": "es2020",
+    "module": "esnext",
+    "moduleResolution": "bundler",
+    "jsx": "react-jsx",
+    "strict": true,
+    "skipLibCheck": true,
+    "lib": ["es2020", "dom", "dom.iterable"],
+    "noEmit": true,
+    "paths": {
+      "@pmndrs/scheduler": ["../../src/index.ts"],
+      "@pmndrs/scheduler/react": ["../../src/react.ts"]
+    }
+  },
+  "include": ["src"]
+}

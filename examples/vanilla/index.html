@@ -1,0 +1,36 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>@pmndrs/scheduler — vanilla</title>
+    <style>
+      body {
+        margin: 0;
+        display: grid;
+        place-items: center;
+        height: 100vh;
+        background: #111;
+        font-family: monospace;
+        color: #eee;
+      }
+      #box {
+        width: 80px;
+        height: 80px;
+        background: #6366f1;
+        border-radius: 12px;
+      }
+      #hud {
+        position: fixed;
+        top: 12px;
+        left: 12px;
+        opacity: 0.7;
+      }
+    </style>
+  </head>
+  <body>
+    <div id="hud"></div>
+    <div id="box"></div>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>
