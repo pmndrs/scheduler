@@ -1,6 +1,6 @@
 {
   "name": "@pmndrs/scheduler",
-  "version": "0.0.0",
+  "version": "0.1.0",
   "description": "Framework-agnostic frame scheduler with phases, priorities and FPS throttling — the engine behind react-three-fiber's useFrame.",
   "keywords": [
     "scheduler",
