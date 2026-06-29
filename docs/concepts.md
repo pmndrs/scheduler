@@ -23,6 +23,16 @@ time, and a frame counter. Because that window is small — and the back half of
 usually reserved for the actual draw — you have to plan the work you do. That window is
 your **frame budget**, and the scheduler exists to help you spend it deliberately.
 
+```
+  one frame @ 60 fps  ≈  16.7 ms
+  ┌─────────┬─────────┬─────────┬─────────┬─────────┬─────────┐
+  │  start  │  input  │ physics │ update  │ render  │ finish  │
+  └─────────┴─────────┴─────────┴─────────┴─────────┴─────────┘
+  0 ms ──────────── jobs run in phase order ──────────► 16.7 ms
+                                  └─ the draw lands here, before
+                                     the window closes
+```
+
 ## Jobs and phases
 
 Every `register` (vanilla) or `useFrame` (React) call creates a **job**. Each frame the
