@@ -1,6 +1,6 @@
 # @pmndrs/scheduler
 
-A small, framework-agnostic frame scheduler with **phases**, **priorities**, and **per-job FPS throttling** — the engine behind [react-three-fiber](https://github.com/pmndrs/react-three-fiber)'s `useFrame`, extracted to run on its own.
+A small, **standalone**, framework-agnostic frame scheduler with **phases**, **priorities**, and **per-job FPS throttling**. One RAF loop, any renderer, no framework required.
 
 - **One RAF loop** for your whole app, across multiple roots
 - **Phases** (`start → input → physics → update → render → finish`) you can extend at runtime
@@ -8,6 +8,17 @@ A small, framework-agnostic frame scheduler with **phases**, **priorities**, and
 - **FPS throttling** per job, with drop or catch-up semantics
 - **Demand** (`invalidate`) and **manual** (`step`) frame modes
 - Zero dependencies. Vanilla core pulls in **no React**.
+
+## Status: standalone, port in progress
+
+This is its own package, not a build artifact of another library. It began as the core
+frame scheduler inside [react-three-fiber](https://github.com/pmndrs/react-three-fiber)
+(the engine behind its `useFrame`) and is being **ported into an independent, framework-agnostic
+library** with its own API, docs, tests, and release cycle. The r3f lineage is where it came
+from — not something it depends on; the vanilla core ships zero dependencies and no React.
+
+> Pre-1.0: the port is ongoing and the API is still settling, but the package is standalone
+> and usable today. Expect refinements before 1.0.
 
 ## Install
 
@@ -74,9 +85,12 @@ scheduler.register(render, { phase: 'render' })
 
 ## Documentation
 
-- **[Concepts](./docs/concepts.md)** — jobs, phases, the frame budget, and the design.
-- **[useFrame Hook](./docs/use-frame.md)** — the React API: options, controls, examples, best practices.
-- **[Scheduler API](./docs/scheduler.md)** — the full vanilla surface: roots, phases, job control, frameloop, demand mode, manual stepping, testing.
+Three guides, roughly in reading order. **New here? Start with Concepts** — it explains the
+mental model (jobs, phases, the frame budget) that the API references build on.
+
+- **[Concepts](./docs/concepts.md)** — start here. Jobs, phases, the frame budget, FPS throttling, frameloop modes, and the design rationale (why named phases beat priority numbers), ending in a full game-loop example.
+- **[useFrame Hook](./docs/use-frame.md)** — the React API: registration timing, options, controls, examples, and best practices.
+- **[Scheduler API](./docs/scheduler.md)** — the full vanilla surface: roots, phases, job registration & control, frameloop, demand mode, manual stepping, and testing.
 
 ## Examples
 
