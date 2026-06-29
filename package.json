@@ -24,6 +24,9 @@
   },
   "type": "module",
   "sideEffects": false,
+  "publishConfig": {
+    "access": "public"
+  },
   "main": "./dist/index.cjs",
   "module": "./dist/index.mjs",
   "types": "./dist/index.d.ts",
@@ -46,6 +49,7 @@
   },
   "scripts": {
     "build": "unbuild",
+    "prepack": "pnpm build",
     "stub": "unbuild --stub",
     "dev": "unbuild --stub",
     "test": "vitest run",
