@@ -7,10 +7,11 @@ every frame and returns controls for stepping, pausing, and resuming the job.
 import { useFrame } from '@pmndrs/scheduler/react'
 ```
 
-> `useFrame` is the same primitive react-three-fiber re-exports. There, the callback also
-> receives r3f's `RootState` (`gl`, `scene`, `camera`, …). Used standalone via
-> `@pmndrs/scheduler/react`, the callback receives **timing-only** state unless a root
-> injects its own — see [Frame state](#frame-state).
+> react-three-fiber ships its **own** `useFrame` built on this same scheduler, where the
+> callback receives r3f's `RootState` (`renderer`, `scene`, `camera`, …) and is
+> _host-guaranteed_ — outside a `<Canvas>` it waits for one. The standalone
+> `@pmndrs/scheduler/react` hook documented here has no host requirement: it runs immediately
+> with **timing-only** state unless a root injects its own — see [Frame state](#frame-state).
 
 ## Basic usage
 
@@ -53,10 +54,15 @@ function GameLoop() {
 }
 ```
 
-If a host registers _later_ — which happens in react-three-fiber, since React fires a
-child's `useFrame` effect before the parent `<Canvas>`'s root registration — the host
-**adopts** the already-registered job, and it begins receiving host state on the next frame.
-You never wait or coordinate; ordering is handled for you.
+If a host registers _later_, it **adopts** the already-registered job, which then begins
+receiving the host's state on the next frame — no waiting or coordination; ordering is handled
+for you. That's the behavior of this standalone hook.
+
+> react-three-fiber's own `useFrame` builds on the same adoption mechanism but additionally
+> **holds the callback until a host is present**, so its callbacks always receive full
+> `RootState` (never timing-only frames). Outside a `<Canvas>` it effectively waits; for
+> hostless loops you use this `@pmndrs/scheduler` hook instead.
+
 See [Ambient root & host adoption](./design/ambient-root.md).
 
 ### Scheduler access only
