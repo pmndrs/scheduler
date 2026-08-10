@@ -384,6 +384,33 @@ describe('Scheduler', () => {
     expect(calls).toEqual(['job1', 'job2', 'job1', 'job2'])
   })
 
+  // Regression: Bug #1 — jobs registered with the { before: 'render' } option must run
+  // AFTER the update phase but BEFORE render. A bogus phase name would be appended after
+  // render/finish by the sorter, running these jobs a frame too late. This exercises the
+  // auto-generated 'before:render' phase plus job-to-job `after` chaining within it, which
+  // is exactly how r3f registers its frustum/visibility system jobs.
+  it('runs { before: render } jobs after update and before render', () => {
+    const calls: string[] = []
+
+    scheduler.register(() => calls.push('update'), { id: 'update-job', rootId: 'test-root', phase: 'update' })
+    scheduler.register(() => calls.push('render'), { id: 'render-job', rootId: 'test-root', phase: 'render' })
+    scheduler.register(() => calls.push('frustum'), { id: 'frustum', rootId: 'test-root', before: 'render' })
+    scheduler.register(() => calls.push('visibility'), {
+      id: 'visibility',
+      rootId: 'test-root',
+      before: 'render',
+      after: 'frustum',
+    })
+
+    scheduler.step()
+
+    // update precedes both checks; both checks precede render; frustum precedes visibility
+    expect(calls.indexOf('update')).toBeLessThan(calls.indexOf('frustum'))
+    expect(calls.indexOf('frustum')).toBeLessThan(calls.indexOf('visibility'))
+    expect(calls.indexOf('visibility')).toBeLessThan(calls.indexOf('render'))
+    expect(calls).toEqual(['update', 'frustum', 'visibility', 'render'])
+  })
+
   it('supports stepJob() for a single job', () => {
     const calls: string[] = []
 
