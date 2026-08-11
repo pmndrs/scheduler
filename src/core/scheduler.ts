@@ -136,8 +136,8 @@ export class Scheduler {
   private idleCallbacks: Set<(timestamp: number) => void> = new Set()
   private nextJobIndex: number = 0
   private jobStateListeners: Map<string, Set<() => void>> = new Map()
-  private pendingFrames: number = 0
   private _frameloop: Frameloop = 'always'
+  private forceRunning: boolean = false
 
   //* Error Handling & Root-Ready State ================================
 
@@ -155,12 +155,13 @@ export class Scheduler {
   }
 
   set frameloop(mode: Frameloop) {
-    if (this._frameloop === mode) return
-    const wasAlways = this._frameloop === 'always'
     this._frameloop = mode
 
-    if (mode === 'always' && !this.loopState.running && this.roots.size > 0) this.start()
-    else if (mode !== 'always' && wasAlways) this.stop()
+    for (const root of this.roots.values()) {
+      this.applyRootFrameloop(root, mode)
+    }
+
+    this.reconcileLoop()
   }
 
   get isRunning(): boolean {
@@ -198,6 +199,8 @@ export class Scheduler {
       jobs: new Map(),
       sortedJobs: [],
       needsRebuild: false,
+      frameloop: options.frameloop ?? this._frameloop,
+      pendingFrames: 0,
     }
 
     // Bind error handler from root
@@ -212,8 +215,6 @@ export class Scheduler {
     // Notify waiters on first root
     if (this.roots.size === 1) {
       this.notifyRootReady()
-      // First root starts the loop (if frameloop allows)
-      if (this._frameloop === 'always') this.start()
     }
 
     // Host adoption: the first non-ambient root to register adopts any orphan
@@ -224,6 +225,8 @@ export class Scheduler {
     if (id !== Scheduler.AMBIENT_ID) {
       this.adoptAmbientOrphans(entry)
     }
+
+    this.reconcileLoop()
 
     return () => this.unregisterRoot(id)
   }
@@ -285,7 +288,10 @@ export class Scheduler {
       // Clear error handler to avoid stale references when new roots register
       // @see https://github.com/pmndrs/react-three-fiber/issues/3651
       this.errorHandler = null
+      return
     }
+
+    this.reconcileLoop()
   }
 
   /**
@@ -650,12 +656,21 @@ export class Scheduler {
   //* Frame Loop Control Methods ================================
 
   /**
-   * Start the requestAnimationFrame loop.
-   * Resets timing state (elapsedTime, frameCount) on start.
-   * No-op if already running.
+   * Force the requestAnimationFrame loop to run continuously for every root.
+   * Root lifecycle modes resume control after stop() or the last root is removed.
    * @returns {void}
    */
   start(): void {
+    this.forceRunning = true
+    this.startLoop()
+  }
+
+  /**
+   * Start the shared RAF driver without overriding root lifecycle selection.
+   * @returns {void}
+   * @private
+   */
+  private startLoop(): void {
     if (this.loopState.running) return
     const { elapsedTime, createdAt } = this.loopState
     let adjustedCreated = 0
@@ -684,6 +699,16 @@ export class Scheduler {
    * @returns {void}
    */
   stop(): void {
+    this.forceRunning = false
+    this.stopLoop()
+  }
+
+  /**
+   * Stop the shared RAF driver without changing its override policy.
+   * @returns {void}
+   * @private
+   */
+  private stopLoop(): void {
     if (!this.loopState.running) return
 
     this.loopState.running = false
@@ -695,9 +720,25 @@ export class Scheduler {
   }
 
   /**
-   * Request frames to be rendered in demand mode.
-   * Accumulates pending frames (capped at 60) and starts the loop if not running.
-   * No-op if frameloop is not 'demand'.
+   * Set the frame policy for one root.
+   * @param {string} rootId - Root to update
+   * @param {Frameloop} mode - New frame policy
+   * @returns {void}
+   */
+  setRootFrameloop(rootId: string, mode: Frameloop): void {
+    const root = this.roots.get(rootId)
+    if (!root) {
+      console.warn(`[Scheduler] Root "${rootId}" not found; frameloop not updated.`)
+      return
+    }
+
+    if (!this.applyRootFrameloop(root, mode)) return
+    this.reconcileLoop()
+  }
+
+  /**
+   * Request frames for every demand root.
+   * Each root owns an independent pending count capped at 60.
    * @param {number} [frames=1] - Number of frames to request
    * @param {boolean} [stackFrames=false] - Whether to add frames to existing pending count
    *   - `false` (default): Sets pending frames to the specified value (replaces existing count)
@@ -720,11 +761,34 @@ export class Scheduler {
    * scheduler.invalidate(2, true);
    */
   invalidate(frames: number = 1, stackFrames: boolean = false): void {
-    if (this._frameloop !== 'demand') return
-    const baseFrames = stackFrames ? this.pendingFrames : 0
-    this.pendingFrames = Math.min(60, baseFrames + frames)
+    let invalidated = false
 
-    if (!this.loopState.running && this.pendingFrames > 0) this.start()
+    for (const root of this.roots.values()) {
+      if (root.frameloop !== 'demand') continue
+      this.requestRootFrames(root, frames, stackFrames)
+      invalidated = true
+    }
+
+    if (invalidated) this.reconcileLoop()
+  }
+
+  /**
+   * Request frames for one demand root.
+   * @param {string} rootId - Root to invalidate
+   * @param {number} [frames=1] - Number of frames to request
+   * @param {boolean} [stackFrames=false] - Whether to add to the pending count
+   * @returns {void}
+   */
+  invalidateRoot(rootId: string, frames: number = 1, stackFrames: boolean = false): void {
+    const root = this.roots.get(rootId)
+    if (!root) {
+      console.warn(`[Scheduler] Root "${rootId}" not found; invalidation ignored.`)
+      return
+    }
+    if (root.frameloop !== 'demand') return
+
+    this.requestRootFrames(root, frames, stackFrames)
+    this.reconcileLoop()
   }
 
   /**
@@ -815,15 +879,13 @@ export class Scheduler {
   private loop = (timestamp: number): void => {
     if (!this.loopState.running) return
 
-    this.executeFrame(timestamp)
+    this.executeFrame(timestamp, this.forceRunning ? 'all' : 'automatic')
+    if (!this.loopState.running) return
 
-    // Handle demand mode
-    if (this._frameloop === 'demand') {
-      this.pendingFrames = Math.max(0, this.pendingFrames - 1)
-      if (this.pendingFrames === 0) {
-        this.notifyIdle(timestamp)
-        return this.stop()
-      }
+    if (!this.forceRunning && !this.hasAutomaticWork()) {
+      this.notifyIdle(timestamp)
+      this.stopLoop()
+      return
     }
 
     // Schedule next frame
@@ -837,7 +899,11 @@ export class Scheduler {
    * @returns {void}
    * @private
    */
-  private executeFrame(timestamp: number): void {
+  private executeFrame(timestamp: number, execution: 'all' | 'automatic' = 'all'): void {
+    // Snapshot root eligibility at the frame boundary so callback invalidations
+    // cannot make later roots run in the same frame based on registration order.
+    const frameRoots = execution === 'automatic' ? this.collectAutomaticRoots() : Array.from(this.roots.values())
+
     // Update timing (RAF provides ms, convert delta to seconds for consistency with legacy THREE.Clock)
     // Handle first frame case where lastTime is null - use timestamp as base (delta = 0)
     const deltaMs = this.loopState.lastTime !== null ? timestamp - this.loopState.lastTime : 0
@@ -850,7 +916,9 @@ export class Scheduler {
     this.runGlobalJobs(this.globalBeforeJobs, timestamp)
 
     // 2. For each root, run its jobs
-    for (const root of this.roots.values()) {
+    for (const root of frameRoots) {
+      // A preceding callback may have removed a root after the frame snapshot.
+      if (this.roots.get(root.id) !== root) continue
       this.tickRoot(root, timestamp, delta)
     }
 
@@ -916,6 +984,83 @@ export class Scheduler {
         this.triggerError(error instanceof Error ? error : new Error(String(error)))
       }
     }
+  }
+
+  /**
+   * Apply a root mode without reconciling the shared driver.
+   * @param {RootEntry} root - Root to update
+   * @param {Frameloop} mode - New frame policy
+   * @returns {boolean} Whether the root changed
+   * @private
+   */
+  private applyRootFrameloop(root: RootEntry, mode: Frameloop): boolean {
+    if (root.frameloop === mode) return false
+
+    root.frameloop = mode
+    if (mode !== 'demand') root.pendingFrames = 0
+    return true
+  }
+
+  /**
+   * Update one root's pending-frame count.
+   * @param {RootEntry} root - Demand root to invalidate
+   * @param {number} frames - Requested frame count
+   * @param {boolean} stackFrames - Add to or replace the current count
+   * @returns {void}
+   * @private
+   */
+  private requestRootFrames(root: RootEntry, frames: number, stackFrames: boolean): void {
+    const baseFrames = stackFrames ? root.pendingFrames : 0
+    root.pendingFrames = Math.min(60, Math.max(0, baseFrames + frames))
+  }
+
+  /**
+   * Check whether a root should execute on an automatically driven frame.
+   * @param {RootEntry} root - Root to inspect
+   * @returns {boolean} True when the root has automatic work
+   * @private
+   */
+  private shouldTickRoot(root: RootEntry): boolean {
+    return root.frameloop === 'always' || (root.frameloop === 'demand' && root.pendingFrames > 0)
+  }
+
+  /**
+   * Snapshot roots eligible for the next automatic frame and consume demand tokens.
+   * @returns {RootEntry[]} Roots that should execute in registration order
+   * @private
+   */
+  private collectAutomaticRoots(): RootEntry[] {
+    const frameRoots: RootEntry[] = []
+
+    for (const root of this.roots.values()) {
+      if (!this.shouldTickRoot(root)) continue
+      if (root.frameloop === 'demand') root.pendingFrames--
+      frameRoots.push(root)
+    }
+
+    return frameRoots
+  }
+
+  /**
+   * Check whether any root requires the shared RAF driver.
+   * @returns {boolean} True when automatic work exists
+   * @private
+   */
+  private hasAutomaticWork(): boolean {
+    for (const root of this.roots.values()) {
+      if (this.shouldTickRoot(root)) return true
+    }
+    return false
+  }
+
+  /**
+   * Start or stop the shared RAF driver from aggregate root state.
+   * @returns {void}
+   * @private
+   */
+  private reconcileLoop(): void {
+    if (this.forceRunning || this.hasAutomaticWork()) this.startLoop()
+    else this.stopLoop()
   }
 
   //* Debug & Inspection Methods ================================

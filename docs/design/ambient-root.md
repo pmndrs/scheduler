@@ -85,9 +85,10 @@ rule — strictly _less_ machinery than today.
    survive migration unchanged. Only the owning root changes.
 6. **State enrichment.** After adoption, callbacks receive the host's `getState()` output.
    Before adoption (standalone, or the sub-ms pre-adoption window in r3f) they receive `{}`.
-7. **Frameloop / error handler** come from the adopting host
-   ([scheduler.ts:210](../../src/core/scheduler.ts#L210)). The host setting `frameloop`
-   applies as it does today.
+7. **Frameloop / error handler** come from the adopting host. Jobs migrate, but the
+   ambient root's mode and pending demand frames do not. The scheduler reconciles its
+   shared RAF driver after adoption, so a demand host can stop an ambient always loop and
+   an always host can start a sleeping ambient loop.
 8. **Loop start** happens when the first root gains its first job (ambient creation in the
    standalone case). For r3f this means a sub-millisecond window where the loop may run with
    `{}` state before the Canvas adopts. This is **benign** (nothing renders pre-host; the
@@ -160,7 +161,7 @@ Core:
 - [ ] Jobs registered with explicit `rootId` are **not** adopted and stay on their root.
 - [ ] Second host registers its own root and adopts nothing.
 - [ ] `jobStateListeners` / reactive pause state survive migration (listener still fires).
-- [ ] Host `frameloop` and `onError` apply post-adoption.
+- [x] Host `frameloop` and `onError` apply post-adoption.
 - [ ] `addPhase` / custom phases on jobs survive migration (needsRebuild honored).
 
 React hook:

@@ -221,34 +221,38 @@ jobs stay capped.
 
 ## Frameloop modes
 
-Control how the loop runs via `scheduler.frameloop`:
+The scheduler owns one RAF driver, while each root owns its wake policy:
+
+- **`always`** — that root runs every animation frame.
+- **`demand`** — that root sleeps until it is invalidated.
+- **`never`** — that root runs only during an explicit manual step.
 
 ```ts
-scheduler.frameloop = 'always' // continuous RAF (default)
-scheduler.frameloop = 'demand' // only render when invalidate() is called
-scheduler.frameloop = 'never' //  manual — advance with step()
+scheduler.registerRoot('hero', { frameloop: 'demand' })
+scheduler.registerRoot('game', { frameloop: 'always' })
+
+scheduler.invalidateRoot('hero') // wakes only the hero
 ```
 
-- **`always`** — jobs run every animation frame.
-- **`demand`** — the loop sleeps until `scheduler.invalidate()` requests frames. Great for
-  static scenes that change occasionally.
-- **`never`** — nothing runs until you call `scheduler.step()`. Great for tests and
-  non-realtime rendering.
+The RAF remains active while any root is `always` or any demand root has pending frames.
+Sleeping roots are skipped entirely, including their state provider and jobs.
+
+For single-root and legacy usage, `scheduler.frameloop` remains a bulk control. Its setter
+updates every existing root and becomes the default for roots registered later:
 
 ```ts
-// demand
 scheduler.frameloop = 'demand'
 button.addEventListener('click', () => {
   updateSomething()
-  scheduler.invalidate() // request one frame
+  scheduler.invalidate() // wakes every demand root
 })
 
-// never
 scheduler.frameloop = 'never'
-scheduler.step() // advance exactly one frame
+scheduler.step() // manually advances every root once
 ```
 
-> In react-three-fiber the `<Canvas frameloop="...">` prop sets this for you.
+`start()` and `stop()` are low-level overrides. An explicit `start()` runs every root
+continuously until `stop()` is called.
 
 ## A real game loop
 

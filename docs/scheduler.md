@@ -15,7 +15,8 @@ directly from any JavaScript app.
 - Per-job FPS throttling with drop/catch-up semantics
 - Pause/resume individual jobs
 - Manual stepping for testing and `frameloop='never'`
-- Demand mode via `invalidate()`
+- Per-root `always`, `demand`, and `never` lifecycle modes
+- Root-scoped and fan-out invalidation
 
 ## Architecture
 
@@ -150,13 +151,14 @@ explicitly for multi-root setups).
 
 ### `registerRoot(id, options?)`
 
-Register a root. The first root to register starts the loop (when `frameloop='always'`).
-Returns an unsubscribe function.
+Register a root. An `always` root starts the shared RAF driver; demand and never roots stay
+idle until explicitly requested. Returns an unsubscribe function.
 
 ```ts
 interface RootOptions {
   getState?: () => any // state provider merged into the frame state
   onError?: (error: Error) => void // job error handler (default: console.error)
+  frameloop?: 'always' | 'demand' | 'never' // defaults to scheduler.frameloop
 }
 ```
 
@@ -165,6 +167,7 @@ interface RootOptions {
 const unsubscribe = scheduler.registerRoot('my-root', {
   getState: () => store.getState(),
   onError: (err) => reportError(err),
+  frameloop: 'demand',
 })
 
 // Minimal — timing-only state
@@ -173,7 +176,20 @@ scheduler.registerRoot('standalone')
 
 - `getState` is how a host injects its own state (r3f injects its `RootState`). Whatever it
   returns is spread into the object passed to every job callback, alongside timing.
+- Roots share timing and one RAF driver, but their mode and pending demand frames are
+  independent.
 - The last root to unregister stops the loop.
+
+### `setRootFrameloop(rootId, mode)`
+
+Change one root's lifecycle mode without affecting its siblings:
+
+```ts
+scheduler.setRootFrameloop('my-root', 'demand')
+```
+
+Leaving demand mode clears that root's pending frame count. An unknown root warns and is
+otherwise ignored.
 
 ### `unregisterRoot(id)`
 
@@ -325,9 +341,9 @@ const unsub = scheduler.subscribeJobState('my-job', () => {
 
 ### `start()` / `stop()`
 
-Start or stop the RAF loop. `start()` is a no-op if already running and is called
-automatically when the first root registers (under `frameloop='always'`); `stop()` is
-called automatically when the last root unregisters.
+Explicitly override the automatic root lifecycle. `start()` runs every root continuously;
+`stop()` cancels that override and the active RAF. Normal root registration, mode changes,
+and invalidation automatically manage the driver without requiring these methods.
 
 ```ts
 scheduler.start()
@@ -345,15 +361,16 @@ scheduler.frameloop = 'demand'
 ```
 
 - `'always'` — continuous (default).
-- `'demand'` — render only when `invalidate()` is called.
-- `'never'` — manual; advance with `step()`.
+- `'demand'` — run when invalidated.
+- `'never'` — run during manual stepping.
 
-Switching to `'always'` starts the loop; switching away from it stops the loop.
+This property is the compatibility bulk control: setting it updates every existing root
+and sets the default for roots registered later. The getter returns that default. Use
+`setRootFrameloop` when roots need different modes.
 
 ### `invalidate(frames?, stackFrames?)`
 
-Request frames in demand mode. Accumulates pending frames (capped at 60) and starts the
-loop if needed. No-op unless `frameloop === 'demand'`.
+Request frames for every demand root. Each root gets an independent pending count capped at 60. Always and never roots are unchanged.
 
 ```ts
 scheduler.invalidate() // one frame
@@ -362,8 +379,22 @@ scheduler.invalidate(3, false) // set pending to exactly 3
 scheduler.invalidate(2, true) // add 2 to the pending count
 ```
 
-Each executed frame decrements the pending count; when it hits 0 the loop stops and
-[`onIdle`](#onidlecallback) callbacks fire.
+Each demand root decrements its own pending count when it executes. The RAF stops and
+[`onIdle`](#onidlecallback) callbacks fire when no always root or pending demand root
+remains.
+
+### `invalidateRoot(rootId, frames?, stackFrames?)`
+
+Request frames for one demand root:
+
+```ts
+scheduler.invalidateRoot('my-root')
+scheduler.invalidateRoot('my-root', 5)
+scheduler.invalidateRoot('my-root', 2, true)
+```
+
+Invalidating during that root's callback schedules a subsequent frame; it is not consumed
+by the frame currently executing. Calls for always and never roots are no-ops.
 
 ### `resetTiming()`
 

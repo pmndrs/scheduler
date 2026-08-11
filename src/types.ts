@@ -87,6 +87,8 @@ export interface RootOptions {
   getState?: () => any
   /** Error handler for job errors. Falls back to console.error if not provided. */
   onError?: (error: Error) => void
+  /** Root frame policy. Defaults to the scheduler's current frameloop setting. */
+  frameloop?: Frameloop
 }
 
 //* Controls returned from useFrame --------------------------------
@@ -150,11 +152,13 @@ export interface SchedulerApi {
   stop(): void
   readonly isRunning: boolean
   frameloop: Frameloop
+  setRootFrameloop(rootId: string, mode: Frameloop): void
 
   //* Manual Stepping
   step(timestamp?: number): void
   stepJob(id: string, timestamp?: number): void
   invalidate(frames?: number, stackFrames?: boolean): void
+  invalidateRoot(rootId: string, frames?: number, stackFrames?: boolean): void
 
   //* Per-Job Control
   isJobPaused(id: string): boolean
@@ -256,6 +260,10 @@ export interface RootEntry {
   sortedJobs: Job[]
   /** Whether sortedJobs needs rebuilding */
   needsRebuild: boolean
+  /** Frame policy for this root */
+  frameloop: Frameloop
+  /** Demand frames waiting to be executed */
+  pendingFrames: number
 }
 
 /**

@@ -4,6 +4,31 @@ import { rebuildSortedJobs } from '../src/core/sorter'
 import { shouldRun } from '../src/core/rateLimiter'
 import type { Job } from '../src/types'
 
+//* Deterministic RAF Controller ==============================
+
+const createRafController = () => {
+  const callbacks = new Map<number, FrameRequestCallback>()
+  let nextId = 1
+
+  vi.stubGlobal('requestAnimationFrame', (callback: FrameRequestCallback) => {
+    const id = nextId++
+    callbacks.set(id, callback)
+    return id
+  })
+  vi.stubGlobal('cancelAnimationFrame', (id: number) => callbacks.delete(id))
+
+  return {
+    flush(timestamp: number) {
+      const queued = [...callbacks.values()]
+      callbacks.clear()
+      for (const callback of queued) callback(timestamp)
+    },
+    get size() {
+      return callbacks.size
+    },
+  }
+}
+
 //* Cross-Bundle Singleton ==============================
 // Mixing imports from different bundles must yield ONE scheduler instance.
 // This is guaranteed by the Symbol.for('@pmndrs/scheduler') global key.
@@ -384,11 +409,9 @@ describe('Scheduler', () => {
     expect(calls).toEqual(['job1', 'job2', 'job1', 'job2'])
   })
 
-  // Regression: Bug #1 — jobs registered with the { before: 'render' } option must run
-  // AFTER the update phase but BEFORE render. A bogus phase name would be appended after
-  // render/finish by the sorter, running these jobs a frame too late. This exercises the
-  // auto-generated 'before:render' phase plus job-to-job `after` chaining within it, which
-  // is exactly how r3f registers its frustum/visibility system jobs.
+  // Phase-order regression: jobs registered with { before: 'render' } must run after
+  // update and before render. This also exercises job-to-job chaining inside the
+  // auto-generated 'before:render' phase used by r3f system jobs.
   it('runs { before: render } jobs after update and before render', () => {
     const calls: string[] = []
 
@@ -481,6 +504,306 @@ describe('Scheduler', () => {
     expect(calls.length).toBeGreaterThan(0)
     // Should have stopped after running the requested frame(s)
     expect(scheduler.isRunning).toBe(false)
+  })
+})
+
+//* Per-root Frameloop ==============================
+
+describe('Scheduler per-root frameloop', () => {
+  beforeEach(() => {
+    Scheduler.reset()
+  })
+
+  afterEach(() => {
+    Scheduler.reset()
+    vi.unstubAllGlobals()
+  })
+
+  it('keeps an always root running while a demand root sleeps', () => {
+    const raf = createRafController()
+    const scheduler = Scheduler.get()
+    const calls: string[] = []
+
+    scheduler.registerRoot('always', { frameloop: 'always' })
+    scheduler.registerRoot('demand', { frameloop: 'demand' })
+    scheduler.register(() => calls.push('always'), { rootId: 'always' })
+    scheduler.register(() => calls.push('demand'), { rootId: 'demand' })
+
+    raf.flush(1000)
+
+    expect(calls).toEqual(['always'])
+    expect(raf.size).toBe(1)
+  })
+
+  it('invalidates only the selected demand root', () => {
+    const raf = createRafController()
+    const scheduler = Scheduler.get()
+    const calls: string[] = []
+
+    scheduler.registerRoot('always', { frameloop: 'always' })
+    scheduler.registerRoot('demand', { frameloop: 'demand' })
+    scheduler.register(() => calls.push('always'), { rootId: 'always' })
+    scheduler.register(() => calls.push('demand'), { rootId: 'demand' })
+
+    raf.flush(1000)
+    scheduler.invalidateRoot('demand')
+    raf.flush(1016)
+    raf.flush(1032)
+
+    expect(calls).toEqual(['always', 'always', 'demand', 'always'])
+    expect(raf.size).toBe(1)
+  })
+
+  it('tracks pending frames independently for each demand root', () => {
+    const raf = createRafController()
+    const scheduler = Scheduler.get()
+    let firstRuns = 0
+    let secondRuns = 0
+    let idleCalls = 0
+
+    scheduler.registerRoot('first', { frameloop: 'demand' })
+    scheduler.registerRoot('second', { frameloop: 'demand' })
+    scheduler.register(() => firstRuns++, { rootId: 'first' })
+    scheduler.register(() => secondRuns++, { rootId: 'second' })
+    scheduler.onIdle(() => idleCalls++)
+
+    scheduler.invalidateRoot('first', 1)
+    scheduler.invalidateRoot('second', 3)
+    raf.flush(1000)
+    raf.flush(1016)
+    raf.flush(1032)
+
+    expect(firstRuns).toBe(1)
+    expect(secondRuns).toBe(3)
+    expect(idleCalls).toBe(1)
+    expect(scheduler.isRunning).toBe(false)
+    expect(raf.size).toBe(0)
+  })
+
+  it('fans global invalidation out to demand roots but not never roots', () => {
+    const raf = createRafController()
+    const scheduler = Scheduler.get()
+    const calls: string[] = []
+
+    scheduler.registerRoot('first', { frameloop: 'demand' })
+    scheduler.registerRoot('second', { frameloop: 'demand' })
+    scheduler.registerRoot('manual', { frameloop: 'never' })
+    scheduler.register(() => calls.push('first'), { rootId: 'first' })
+    scheduler.register(() => calls.push('second'), { rootId: 'second' })
+    scheduler.register(() => calls.push('manual'), { rootId: 'manual' })
+
+    scheduler.invalidate()
+    raf.flush(1000)
+
+    expect(calls).toEqual(['first', 'second'])
+    expect(raf.size).toBe(0)
+  })
+
+  it('stops only after the final always root changes to demand', () => {
+    const raf = createRafController()
+    const scheduler = Scheduler.get()
+    const calls: string[] = []
+
+    scheduler.registerRoot('first', { frameloop: 'always' })
+    scheduler.registerRoot('second', { frameloop: 'always' })
+    scheduler.register(() => calls.push('first'), { rootId: 'first' })
+    scheduler.register(() => calls.push('second'), { rootId: 'second' })
+
+    raf.flush(1000)
+    scheduler.setRootFrameloop('second', 'demand')
+    raf.flush(1016)
+
+    expect(calls).toEqual(['first', 'second', 'first'])
+    expect(scheduler.isRunning).toBe(true)
+
+    scheduler.setRootFrameloop('first', 'demand')
+
+    expect(scheduler.isRunning).toBe(false)
+    expect(raf.size).toBe(0)
+  })
+
+  it('preserves invalidation requested during a demand callback', () => {
+    const raf = createRafController()
+    const scheduler = Scheduler.get()
+    let runs = 0
+
+    scheduler.registerRoot('demand', { frameloop: 'demand' })
+    scheduler.register(
+      () => {
+        runs++
+        if (runs === 1) scheduler.invalidateRoot('demand')
+      },
+      { rootId: 'demand' },
+    )
+
+    scheduler.invalidateRoot('demand')
+    raf.flush(1000)
+
+    expect(runs).toBe(1)
+    expect(raf.size).toBe(1)
+
+    raf.flush(1016)
+
+    expect(runs).toBe(2)
+    expect(raf.size).toBe(0)
+  })
+
+  it('defers sibling invalidation raised during the current frame', () => {
+    const raf = createRafController()
+    const scheduler = Scheduler.get()
+    const calls: string[] = []
+
+    scheduler.registerRoot('always', { frameloop: 'always' })
+    scheduler.registerRoot('demand', { frameloop: 'demand' })
+    scheduler.register(
+      () => {
+        calls.push('always')
+        if (calls.length === 1) scheduler.invalidateRoot('demand')
+      },
+      { rootId: 'always' },
+    )
+    scheduler.register(() => calls.push('demand'), { rootId: 'demand' })
+
+    raf.flush(1000)
+    expect(calls).toEqual(['always'])
+
+    raf.flush(1016)
+    expect(calls).toEqual(['always', 'always', 'demand'])
+  })
+
+  it('supports replace, stack, and per-root frame caps', () => {
+    const raf = createRafController()
+    const scheduler = Scheduler.get()
+    let runs = 0
+
+    scheduler.registerRoot('demand', { frameloop: 'demand' })
+    scheduler.register(() => runs++, { rootId: 'demand' })
+
+    scheduler.invalidateRoot('demand', 3)
+    scheduler.invalidateRoot('demand', 2, true)
+
+    for (let frame = 0; frame < 5; frame++) raf.flush(1000 + frame * 16)
+
+    expect(runs).toBe(5)
+    expect(raf.size).toBe(0)
+
+    scheduler.invalidateRoot('demand', 100)
+    for (let frame = 0; frame < 60; frame++) raf.flush(2000 + frame * 16)
+
+    expect(runs).toBe(65)
+    expect(raf.size).toBe(0)
+  })
+
+  it('steps every root manually without consuming demand frames', () => {
+    const raf = createRafController()
+    const scheduler = Scheduler.get()
+    const calls: string[] = []
+
+    scheduler.registerRoot('demand', { frameloop: 'demand' })
+    scheduler.registerRoot('manual', { frameloop: 'never' })
+    scheduler.register(() => calls.push('demand'), { rootId: 'demand' })
+    scheduler.register(() => calls.push('manual'), { rootId: 'manual' })
+
+    scheduler.invalidateRoot('demand')
+    scheduler.step(1000)
+    raf.flush(1016)
+
+    expect(calls).toEqual(['demand', 'manual', 'demand'])
+    expect(raf.size).toBe(0)
+  })
+
+  it('lets explicit start and stop override root lifecycle selection', () => {
+    const raf = createRafController()
+    const scheduler = Scheduler.get()
+    const calls: string[] = []
+
+    scheduler.registerRoot('demand', { frameloop: 'demand' })
+    scheduler.registerRoot('manual', { frameloop: 'never' })
+    scheduler.register(() => calls.push('demand'), { rootId: 'demand' })
+    scheduler.register(() => calls.push('manual'), { rootId: 'manual' })
+
+    scheduler.start()
+    raf.flush(1000)
+    raf.flush(1016)
+
+    expect(calls).toEqual(['demand', 'manual', 'demand', 'manual'])
+    expect(raf.size).toBe(1)
+
+    scheduler.stop()
+
+    expect(scheduler.isRunning).toBe(false)
+    expect(raf.size).toBe(0)
+  })
+
+  it('keeps the global frameloop setter as a default and fan-out control', () => {
+    const raf = createRafController()
+    const scheduler = Scheduler.get()
+    const calls: string[] = []
+
+    scheduler.registerRoot('first', { frameloop: 'always' })
+    scheduler.registerRoot('second', { frameloop: 'demand' })
+    scheduler.register(() => calls.push('first'), { rootId: 'first' })
+    scheduler.register(() => calls.push('second'), { rootId: 'second' })
+
+    scheduler.frameloop = 'never'
+
+    expect(scheduler.frameloop).toBe('never')
+    expect(scheduler.isRunning).toBe(false)
+    expect(raf.size).toBe(0)
+
+    scheduler.frameloop = 'always'
+    raf.flush(1000)
+
+    expect(calls).toEqual(['first', 'second'])
+
+    scheduler.registerRoot('third')
+    scheduler.register(() => calls.push('third'), { rootId: 'third' })
+    raf.flush(1016)
+
+    expect(calls).toEqual(['first', 'second', 'first', 'second', 'third'])
+  })
+
+  it('reconciles the host mode after ambient-root adoption', () => {
+    const raf = createRafController()
+    const scheduler = Scheduler.get()
+
+    scheduler.register(() => {}, { id: 'orphan' })
+    expect(scheduler.isRunning).toBe(true)
+
+    scheduler.registerRoot('host', { frameloop: 'demand' })
+
+    expect(scheduler.getRootCount()).toBe(1)
+    expect(scheduler.isRunning).toBe(false)
+    expect(raf.size).toBe(0)
+  })
+
+  it('starts an always host after adopting a sleeping ambient root', () => {
+    const raf = createRafController()
+    const scheduler = Scheduler.get()
+
+    scheduler.frameloop = 'demand'
+    scheduler.register(() => {}, { id: 'orphan' })
+    expect(scheduler.isRunning).toBe(false)
+
+    scheduler.registerRoot('host', { frameloop: 'always' })
+
+    expect(scheduler.getRootCount()).toBe(1)
+    expect(scheduler.isRunning).toBe(true)
+    expect(raf.size).toBe(1)
+  })
+
+  it('warns and no-ops for unknown root lifecycle controls', () => {
+    createRafController()
+    const scheduler = Scheduler.get()
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+
+    scheduler.setRootFrameloop('missing', 'demand')
+    scheduler.invalidateRoot('missing')
+
+    expect(warn).toHaveBeenCalledTimes(2)
+    expect(scheduler.isRunning).toBe(false)
+
+    warn.mockRestore()
   })
 })
 
