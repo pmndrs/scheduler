@@ -159,6 +159,7 @@ interface RootOptions {
   getState?: () => any // state provider merged into the frame state
   onError?: (error: Error) => void // job error handler (default: console.error)
   frameloop?: 'always' | 'demand' | 'never' // defaults to scheduler.frameloop
+  order?: number // execution order; lower runs first (default: 0)
   maxDelta?: number // delta cap in seconds; defaults to one driver frame
 }
 ```
@@ -194,6 +195,26 @@ scheduler.setRootFrameloop('my-root', 'demand')
 
 Leaving demand mode clears that root's pending frame count. An unknown root warns and is
 otherwise ignored.
+
+### `setRootOrder(rootId, order)`
+
+Set one root's execution order. Lower runs first; equal values keep registration order.
+
+```ts
+scheduler.setRootOrder('overlay', 10) // draws after the default-0 roots
+```
+
+Registration order alone isn't stable — Suspense, conditional rendering, and remounts can
+reverse it — so roots that share a renderer and must draw in a fixed sequence should say
+so explicitly rather than relying on mount timing.
+
+Ordering applies only to roots selected for that frame: a sleeping `demand` root ordered
+between two others is skipped, not woken to hold its place. Sorting happens when roots are
+added, removed, or reordered — never per frame.
+
+> Ordering reorders **whole roots**. Execution is root-major (each root runs all of its
+> phases before the next root starts), so "every canvas's physics, then every canvas's
+> render" is not expressible. Job-level `before`/`after` only resolves within one root.
 
 ### `unregisterRoot(id)`
 

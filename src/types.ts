@@ -90,6 +90,15 @@ export interface RootOptions {
   /** Root frame policy. Defaults to the scheduler's current frameloop setting. */
   frameloop?: Frameloop
   /**
+   * Execution order relative to other roots. Lower runs first; ties fall back to
+   * registration order. Defaults to `0`.
+   *
+   * Use this when roots share a renderer and one must draw before another —
+   * registration order alone is not stable under Suspense, conditional rendering,
+   * or remounts.
+   */
+  order?: number
+  /**
    * Largest delta (in seconds) this root's callbacks can receive, capping how far
    * it catches up after skipping frames.
    *
@@ -176,6 +185,7 @@ export interface SchedulerApi {
   frameloop: Frameloop
   defaultFrameloop: Frameloop
   setRootFrameloop(rootId: string, mode: Frameloop): void
+  setRootOrder(rootId: string, order: number): void
 
   //* Manual Stepping
   step(timestamp?: number): void
@@ -218,6 +228,13 @@ export interface Job {
   drop: boolean
   /** Last run timestamp (ms) */
   lastRun?: number
+  /**
+   * The owning root's `accumulatedTime` when this job last ran, in seconds.
+   * Differencing against it yields the time the root experienced since — which is
+   * the job's real delta when throttling made it skip frames, and excludes any
+   * span the root slept through.
+   */
+  lastRunElapsed?: number
   /** Whether job is enabled */
   enabled: boolean
   /** Internal flag: system jobs (like a default render) don't block user takeover */
@@ -289,6 +306,10 @@ export interface RootEntry {
   frameloop: Frameloop
   /** Demand frames waiting to be executed */
   pendingFrames: number
+  /** Execution order; lower runs first, ties broken by `sequence` */
+  order: number
+  /** Registration sequence, for stable ordering between equal `order` values */
+  sequence: number
   /** Timestamp of this root's last tick in ms (null = never ticked) */
   lastTickTime: number | null
   /** Sum of the deltas this root has received, in seconds */

@@ -245,9 +245,15 @@ Both of these exist on `main` and are independent of the lifecycle work. Task 9 
 - Modify: `src/core/rateLimiter.ts`, `src/core/scheduler.ts`, `src/types.ts`
 - Test: `tests/scheduler.test.ts`
 
-- [ ] **Step 1:** Have `shouldRun` record the actual interval it consumed (e.g. `job.lastDelta`), respecting both semantics: with `drop: true` the interval is `now - previousLastRun`; with catch-up it is `steps * minInterval`.
-- [ ] **Step 2:** In `tickRoot`, pass the per-job delta for throttled jobs and the root delta otherwise. Clamp by `root.maxDelta` so a throttled job in a long-sleeping root cannot teleport either.
-- [ ] **Step 3:** Tests — an `fps: 30` job in a 60fps root receives ~0.033; an unthrottled job in the same root still receives ~0.0167; catch-up and drop report their respective intervals.
+- [x] **Step 1:** ~~Record the interval in `shouldRun`~~ **Not needed.** `rateLimiter.ts` is untouched apart from `resetJobTiming`.
+- [x] **Step 2:** Track `job.lastRunElapsed` — the owning root's `accumulatedTime` when the job last ran — and difference it. `resetJobTiming` clears it, so a resumed job isn't billed for the span it was paused.
+- [x] **Step 3:** Tests — a throttled job gets the real interval between its runs; an unthrottled job in the same root is unchanged; a throttled job in a sleeping root doesn't teleport; a resumed job isn't charged for the pause.
+
+> **Deviation — a simpler mechanism, because the planned one collided with Phase 2.** The plan said to clamp the job interval by `root.maxDelta`. That breaks the fix: `maxDelta` now defaults to _one driver frame_, which is smaller than any throttle period, so an `fps: 30` job would still be handed 16ms. Attempts to special-case the cap (one throttle period? two?) all needed an arbitrary constant, and none handled `fps: 45` in a 60Hz loop, where the job genuinely runs every 33ms rather than the 22ms it asked for.
+>
+> Differencing the root's `accumulatedTime` sidesteps all of it. The root's clock already excludes slept frames by construction, so the job inherits the sleep cap for free, needs no new constant, and reports the true interval whatever the throttle rate. It is also uniform: applied to every job, not just throttled ones, and for a job that runs every tick it equals the root delta exactly — so the common path is provably unchanged.
+>
+> **Consequence for `drop: false`.** Catch-up jobs now receive real elapsed time rather than the root delta. That is strictly more accurate than today, but it is _not_ a fixed timestep — a simulation wanting exactly `1/fps` per step must still clamp its own input. Called out in the release notes.
 
 ### Task 9: Unresolvable `before`/`after` targets pollute the global phase graph
 
@@ -260,9 +266,11 @@ Verified: a job with `{ after: 'main' }` alongside `render` and `finish` jobs ex
 - Modify: `src/core/phaseGraph.ts`, `src/core/scheduler.ts`
 - Test: `tests/scheduler.test.ts`
 
-- [ ] **Step 1:** Resolve the target in three tiers: a known **phase** keeps today's auto-phase behavior; a known **job id** adopts that job's phase and relies on the existing intra-bucket topological sort; anything else warns and falls back to `update` **without mutating the phase graph**.
-- [ ] **Step 2:** The job-id tier needs a lookup at `register` time. Resolve it in `Scheduler.register` before calling `resolveConstraintPhase`, keeping `PhaseGraph` free of job knowledge.
-- [ ] **Step 3:** Tests — no phantom phase is created for an unresolvable target; a job-id target lands in the target's phase and sorts after it; an unknown target warns once and defaults to `update`; the existing `{ before: 'render' }` phase-order test still passes.
+- [x] **Step 1:** Three tiers, as planned.
+- [x] **Step 2:** Landed as a private `Scheduler.resolveConstraintPhase` that mirrors `PhaseGraph`'s precedence (first `before`, else first `after`) and delegates to it for the phase tier. `PhaseGraph` stays free of job knowledge.
+- [x] **Step 3:** Tests — a job-id target lands in the target's phase and sorts after it with no phantom phase; an unknown target warns and defaults to `update`; the phase tier still auto-generates as before.
+
+> **Note.** The job-id lookup searches every root, so a cross-root reference now at least lands in a sensible phase instead of after `finish` — but it still cannot order across roots. That is Task 10's job, and the docs say so.
 
 ---
 
@@ -283,12 +291,14 @@ Roots execute in Map registration order, and a job's `after` referencing a job i
 - Produces: `RootOptions.order?: number` (default `0`)
 - Produces: `SchedulerApi.setRootOrder(rootId: string, order: number): void`
 
-- [ ] **Step 1:** Add `order` to `RootOptions` / `RootEntry`, defaulting to `0`, with ties broken by registration index so unconstrained roots keep today's order exactly.
-- [ ] **Step 2:** Maintain a cached sorted root array. Rebuild only on register, unregister, or order change — never per frame.
-- [ ] **Step 3:** Have `collectAutomaticRoots` and `executeFrame('all')` iterate the cached array. Sleeping roots are filtered out of the sorted array without re-sorting, and a sleeping root is never forced to run just because another root orders itself after it.
-- [ ] **Step 4:** Add `setRootOrder(rootId, order)` for runtime changes; warn and no-op on unknown roots.
-- [ ] **Step 5:** Document root-major execution as the contract, and state plainly that ordering reorders whole roots — "all physics across canvases, then all renders" is not expressible.
-- [ ] **Step 6:** Tests — reversed registration plus `order` produces the intended sequence; sleeping roots are skipped without disturbing order; runtime order changes take effect on the next frame; adoption preserves order; equal orders fall back to registration index.
+- [x] **Step 1:** `order` on `RootOptions` / `RootEntry`, default `0`, ties broken by a new `sequence` field (a dedicated counter — `nextRootIndex` belongs to `generateRootId` and only increments when that is called, so it would have produced gaps and mis-ordered explicitly-named roots).
+- [x] **Step 2:** Cached `sortedRoots` + `rootsNeedSort`, rebuilt lazily on register, unregister, or order change.
+- [x] **Step 3:** Both execution paths iterate it. The cache is _replaced_ rather than mutated on re-sort, so a frame that registers a root mid-flight keeps iterating its own snapshot — the existing `roots.get(root.id) !== root` guard still covers removals.
+- [x] **Step 4:** `setRootOrder(rootId, order)`; warns and no-ops on unknown roots.
+- [x] **Step 5:** Documented in `docs/scheduler.md` and `docs/concepts.md`.
+- [x] **Step 6:** Tests — reversed registration, equal-order fallback, runtime reorder with a sleeping root in between, ordering preserved after an unregister, and `step()` following the same order.
+
+> **Also changed:** `getRootIds()` now returns execution order rather than Map order. With no explicit ordering the two are identical, so nothing observable changes for existing callers, and "the order they run in" is the more useful answer when debugging why one canvas drew first.
 
 **Deferred:** root-level `before`/`after` constraints. If a concrete case needs them, extract the Kahn implementation in `sorter.ts:100` to a generic over `{ id, before, after, index }` and reuse it — including its cycle fallback (warn once, append unresolved members in registration order). Unlike jobs, an unresolved _root_ reference should **persist** rather than be dropped at sort time, because async mounting makes late arrival normal.
 

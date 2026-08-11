@@ -128,6 +128,9 @@ export class Scheduler {
   //* Private State ================================
 
   private nextRootIndex: number = 0
+  private nextRootSequence: number = 0
+  private sortedRoots: RootEntry[] = []
+  private rootsNeedSort: boolean = true
   private globalBeforeJobs: Map<string, GlobalJob> = new Map()
   private globalAfterJobs: Map<string, GlobalJob> = new Map()
   private nextGlobalIndex: number = 0
@@ -231,6 +234,8 @@ export class Scheduler {
       needsRebuild: false,
       frameloop: options.frameloop ?? this._frameloop,
       pendingFrames: 0,
+      order: options.order ?? 0,
+      sequence: this.nextRootSequence++,
       lastTickTime: null,
       accumulatedTime: 0,
       maxDelta: options.maxDelta,
@@ -244,6 +249,7 @@ export class Scheduler {
     }
 
     this.roots.set(id, entry)
+    this.rootsNeedSort = true
 
     // Notify waiters on first root
     if (this.roots.size === 1) {
@@ -321,6 +327,7 @@ export class Scheduler {
     }
 
     this.roots.delete(id)
+    this.rootsNeedSort = true
 
     // Last root stops the loop and clears error handler.
     // Uses stopLoop() rather than stop(): teardown must not latch the paused
@@ -532,9 +539,9 @@ export class Scheduler {
     // Resolve phase from options
     let phase = options.phase ?? 'update'
 
-    // If before/after specified without explicit phase, resolve via phaseGraph
+    // If before/after specified without explicit phase, derive one
     if (!options.phase && (options.before || options.after)) {
-      phase = this.phaseGraph.resolveConstraintPhase(options.before, options.after)
+      phase = this.resolveConstraintPhase(options.before, options.after)
     }
 
     // Normalize before/after to Sets
@@ -777,6 +784,44 @@ export class Scheduler {
   }
 
   /**
+   * Set one root's execution order. Lower runs first; ties keep registration order.
+   *
+   * Registration order alone isn't stable — Suspense, conditional rendering, and
+   * remounts can reverse it — so roots that share a renderer and must draw in a
+   * fixed sequence should say so explicitly.
+   * @param {string} rootId - Root to update
+   * @param {number} order - New order value (default for roots is 0)
+   * @returns {void}
+   */
+  setRootOrder(rootId: string, order: number): void {
+    const root = this.roots.get(rootId)
+    if (!root) {
+      console.warn(`[Scheduler] Root "${rootId}" not found; order not updated.`)
+      return
+    }
+
+    if (root.order === order) return
+    root.order = order
+    this.rootsNeedSort = true
+  }
+
+  /**
+   * Roots in execution order, sorted lazily and cached until the set of roots or
+   * their order changes — never per frame.
+   * @returns {RootEntry[]} Roots in the order they should run
+   * @private
+   */
+  private getExecutionRoots(): RootEntry[] {
+    if (this.rootsNeedSort) {
+      this.sortedRoots = Array.from(this.roots.values()).sort((a, b) =>
+        a.order !== b.order ? a.order - b.order : a.sequence - b.sequence,
+      )
+      this.rootsNeedSort = false
+    }
+    return this.sortedRoots
+  }
+
+  /**
    * Request frames for every demand root.
    * Each root owns an independent pending count capped at 60.
    * @param {number} [frames=1] - Number of frames to request
@@ -975,11 +1020,13 @@ export class Scheduler {
   private executeFrame(timestamp: number, execution: 'all' | 'automatic' | RootEntry[] = 'all'): void {
     // Snapshot root eligibility at the frame boundary so callback invalidations
     // cannot make later roots run in the same frame based on registration order.
+    // getExecutionRoots() returns a cached array that is replaced, never mutated,
+    // when roots change — so an in-flight frame keeps iterating its own snapshot.
     const frameRoots =
       execution === 'automatic'
         ? this.collectAutomaticRoots()
         : execution === 'all'
-          ? Array.from(this.roots.values())
+          ? this.getExecutionRoots()
           : execution
 
     // Update timing (RAF provides ms, convert delta to seconds for consistency with legacy THREE.Clock)
@@ -1059,8 +1106,17 @@ export class Scheduler {
     for (const job of root.sortedJobs) {
       if (!shouldRun(job, timestamp)) continue
 
+      // A throttled job skips frames, so the root delta understates how much time
+      // passed for it — an fps:30 job in a 60fps root would be told 16ms every
+      // 33ms and run at half speed. Differencing the root's accumulated time gives
+      // the real interval, and inherits the root's sleep cap for free.
+      const jobDelta = job.lastRunElapsed === undefined ? delta : root.accumulatedTime - job.lastRunElapsed
+      job.lastRunElapsed = root.accumulatedTime
+
+      const jobState = jobDelta === delta ? frameState : ({ ...frameState, delta: jobDelta } as FrameNextState)
+
       try {
-        job.callback(frameState, delta)
+        job.callback(jobState, jobDelta)
       } catch (error) {
         console.error(`[Scheduler] Error in job "${job.id}":`, error)
         // Propagate error via pluggable handler
@@ -1143,7 +1199,7 @@ export class Scheduler {
   private collectAutomaticRoots(): RootEntry[] {
     const frameRoots: RootEntry[] = []
 
-    for (const root of this.roots.values()) {
+    for (const root of this.getExecutionRoots()) {
       if (!this.shouldTickRoot(root)) continue
       if (root.frameloop === 'demand') root.pendingFrames--
       frameRoots.push(root)
@@ -1216,11 +1272,12 @@ export class Scheduler {
   }
 
   /**
-   * Get all registered root IDs in registration order.
+   * Get all registered root IDs in execution order (see {@link Scheduler.setRootOrder}).
+   * With no explicit ordering this is registration order.
    * @returns {string[]} Array of root IDs
    */
   getRootIds(): string[] {
-    return Array.from(this.roots.keys())
+    return this.getExecutionRoots().map((root) => root.id)
   }
 
   /**
@@ -1297,6 +1354,43 @@ export class Scheduler {
    */
   private generateJobId(): string {
     return `job_${this.nextJobIndex}`
+  }
+
+  /**
+   * Derive the phase for a job that declared `before`/`after` without one.
+   *
+   * Three tiers, because the target can be either kind of name:
+   * 1. A **phase** — auto-generate the `before:`/`after:` slot around it.
+   * 2. A **job id** — adopt that job's phase and let the sorter's job-to-job
+   *    ordering position them within it.
+   * 3. Neither — warn and default to `update`.
+   *
+   * Tier 3 previously fell through to the phase graph, which appended an invented
+   * phase to the end of the global order: the job ran after `finish` instead of
+   * where it asked, and the junk phase persisted for every root.
+   * @param {string | string[]} [before] - Before constraint(s)
+   * @param {string | string[]} [after] - After constraint(s)
+   * @returns {string} The phase to place this job in
+   * @private
+   */
+  private resolveConstraintPhase(before?: string | string[], after?: string | string[]): string {
+    // Mirror PhaseGraph's precedence: the first `before` wins, else the first `after`.
+    const first = (value?: string | string[]) => (Array.isArray(value) ? value[0] : value)
+    const target = first(before) ?? first(after)
+    if (!target) return 'update'
+
+    if (this.phaseGraph.hasPhase(target)) {
+      return this.phaseGraph.resolveConstraintPhase(before, after)
+    }
+
+    const targetJob = this.findRootForJob(target)?.jobs.get(target)
+    if (targetJob) return targetJob.phase
+
+    console.warn(
+      `[Scheduler] "${target}" is neither a phase nor a registered job; ` +
+        `defaulting to the "update" phase. Register the target first, or pass an explicit phase.`,
+    )
+    return 'update'
   }
 
   /**

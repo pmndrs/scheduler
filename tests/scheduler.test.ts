@@ -1623,3 +1623,265 @@ describe('Scheduler per-root timing', () => {
     expect(elapsed.at(-1)!).toBeCloseTo(beforeAdoption + 0.016, 5)
   })
 })
+
+//* Phase 3: Throttled Job Deltas ==============================
+// A job that doesn't run every frame must be told how much time it actually
+// missed, or delta-driven work silently runs slow.
+// @see docs/superpowers/plans/2026-08-11-lifecycle-followups.md
+
+describe('Scheduler throttled job timing', () => {
+  beforeEach(() => {
+    Scheduler.reset()
+  })
+
+  afterEach(() => {
+    Scheduler.reset()
+    vi.unstubAllGlobals()
+  })
+
+  it('gives a throttled job the time since its own last run', () => {
+    const raf = createRafController()
+    const scheduler = Scheduler.get()
+    const throttled: number[] = []
+    const everyFrame: number[] = []
+
+    scheduler.registerRoot('root', { frameloop: 'always' })
+    scheduler.register((_state, delta) => throttled.push(delta), { rootId: 'root', fps: 30 })
+    scheduler.register((_state, delta) => everyFrame.push(delta), { rootId: 'root' })
+
+    for (let frame = 0; frame < 7; frame++) raf.flush(1000 + frame * 16)
+
+    // At 16ms frames an fps:30 job lands every third frame — 48ms, not 16ms.
+    // Being told 16ms is what made `x += delta * speed` run at a third speed.
+    expect(throttled.length).toBeGreaterThan(1)
+    expect(throttled[1]).toBeCloseTo(0.048, 5)
+    expect(everyFrame[1]).toBeCloseTo(0.016, 5)
+  })
+
+  it('does not let a throttled job teleport when its root slept', () => {
+    const raf = createRafController()
+    const scheduler = Scheduler.get()
+    const deltas: number[] = []
+
+    scheduler.registerRoot('always', { frameloop: 'always' })
+    scheduler.registerRoot('demand', { frameloop: 'demand' })
+    scheduler.register(() => {}, { rootId: 'always' })
+    scheduler.register((_state, delta) => deltas.push(delta), { rootId: 'demand', fps: 30 })
+
+    scheduler.invalidateRoot('demand')
+    raf.flush(1000)
+
+    // Sibling keeps the driver alive for half a second while demand sleeps.
+    for (let frame = 1; frame <= 30; frame++) raf.flush(1000 + frame * 16)
+
+    scheduler.invalidateRoot('demand')
+    raf.flush(1000 + 31 * 16)
+
+    // The root only experienced one capped frame in between, so the job does too.
+    expect(deltas).toHaveLength(2)
+    expect(deltas[1]).toBeCloseTo(0.016, 5)
+  })
+
+  it('does not charge a resumed job for the time it was paused', () => {
+    const raf = createRafController()
+    const scheduler = Scheduler.get()
+    const deltas: number[] = []
+
+    scheduler.registerRoot('root', { frameloop: 'always' })
+    scheduler.register((_state, delta) => deltas.push(delta), { id: 'job', rootId: 'root' })
+
+    raf.flush(1000)
+    raf.flush(1016)
+
+    scheduler.pauseJob('job')
+    for (let frame = 2; frame < 40; frame++) raf.flush(1000 + frame * 16)
+    scheduler.resumeJob('job')
+
+    raf.flush(1000 + 40 * 16)
+
+    expect(deltas.at(-1)).toBeCloseTo(0.016, 5)
+  })
+})
+
+//* Phase 3: Constraint Target Resolution ==============================
+// An unresolvable before/after target used to invent a phase and append it after
+// `finish`, permanently, for every root.
+// @see docs/superpowers/plans/2026-08-11-lifecycle-followups.md
+
+describe('Scheduler constraint target resolution', () => {
+  beforeEach(() => {
+    Scheduler.reset()
+  })
+
+  afterEach(() => {
+    Scheduler.reset()
+    vi.unstubAllGlobals()
+  })
+
+  it("places a job referencing another job id into that job's phase", () => {
+    createRafController()
+    const scheduler = Scheduler.get()
+    const calls: string[] = []
+
+    scheduler.registerRoot('root')
+    scheduler.register(() => calls.push('target'), { id: 'target', rootId: 'root', phase: 'render' })
+    scheduler.register(() => calls.push('follower'), { rootId: 'root', after: 'target' })
+    scheduler.register(() => calls.push('finish'), { rootId: 'root', phase: 'finish' })
+
+    scheduler.step(1000)
+
+    // Runs in render, right after its target — not stranded after finish.
+    expect(calls).toEqual(['target', 'follower', 'finish'])
+    expect(scheduler.hasPhase('after:target')).toBe(false)
+    expect(scheduler.phases).toEqual(['start', 'input', 'physics', 'update', 'render', 'finish'])
+  })
+
+  it('warns and defaults to update for an unresolvable target', () => {
+    createRafController()
+    const scheduler = Scheduler.get()
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+    const calls: string[] = []
+
+    scheduler.registerRoot('root')
+    scheduler.register(() => calls.push('orphan'), { rootId: 'root', after: 'nothing-here' })
+    scheduler.register(() => calls.push('render'), { rootId: 'root', phase: 'render' })
+
+    scheduler.step(1000)
+
+    expect(warn).toHaveBeenCalledTimes(1)
+    expect(calls).toEqual(['orphan', 'render']) // update runs before render
+    expect(scheduler.phases).not.toContain('after:nothing-here')
+
+    warn.mockRestore()
+  })
+
+  it('still auto-generates a phase for a real phase target', () => {
+    createRafController()
+    const scheduler = Scheduler.get()
+
+    scheduler.registerRoot('root')
+    scheduler.register(() => {}, { rootId: 'root', before: 'render' })
+
+    expect(scheduler.hasPhase('before:render')).toBe(true)
+    expect(scheduler.phases.indexOf('before:render')).toBeLessThan(scheduler.phases.indexOf('render'))
+  })
+})
+
+//* Phase 4: Cross-root Ordering ==============================
+// Roots ran in Map registration order, which Suspense, conditional rendering, or
+// a remount can reverse. Shared-renderer canvases need a stable answer.
+// @see docs/superpowers/plans/2026-08-11-lifecycle-followups.md
+
+describe('Scheduler root ordering', () => {
+  beforeEach(() => {
+    Scheduler.reset()
+  })
+
+  afterEach(() => {
+    Scheduler.reset()
+    vi.unstubAllGlobals()
+  })
+
+  it('runs roots by order regardless of registration sequence', () => {
+    const raf = createRafController()
+    const scheduler = Scheduler.get()
+    const calls: string[] = []
+
+    // Registered backwards, as a Suspense boundary resolving out of order would.
+    scheduler.registerRoot('overlay', { order: 10 })
+    scheduler.registerRoot('main', { order: 0 })
+    scheduler.register(() => calls.push('overlay'), { rootId: 'overlay' })
+    scheduler.register(() => calls.push('main'), { rootId: 'main' })
+
+    raf.flush(1000)
+
+    expect(calls).toEqual(['main', 'overlay'])
+    expect(scheduler.getRootIds()).toEqual(['main', 'overlay'])
+  })
+
+  it('falls back to registration order for equal orders', () => {
+    const raf = createRafController()
+    const scheduler = Scheduler.get()
+    const calls: string[] = []
+
+    scheduler.registerRoot('first')
+    scheduler.registerRoot('second')
+    scheduler.registerRoot('third')
+    scheduler.register(() => calls.push('first'), { rootId: 'first' })
+    scheduler.register(() => calls.push('second'), { rootId: 'second' })
+    scheduler.register(() => calls.push('third'), { rootId: 'third' })
+
+    raf.flush(1000)
+
+    expect(calls).toEqual(['first', 'second', 'third'])
+  })
+
+  it('reorders at runtime without disturbing sleeping roots', () => {
+    const raf = createRafController()
+    const scheduler = Scheduler.get()
+    const calls: string[] = []
+
+    scheduler.registerRoot('a')
+    scheduler.registerRoot('b')
+    scheduler.registerRoot('asleep', { frameloop: 'demand' })
+    scheduler.register(() => calls.push('a'), { rootId: 'a' })
+    scheduler.register(() => calls.push('b'), { rootId: 'b' })
+    scheduler.register(() => calls.push('asleep'), { rootId: 'asleep' })
+
+    raf.flush(1000)
+    expect(calls).toEqual(['a', 'b'])
+
+    scheduler.setRootOrder('b', -1)
+    raf.flush(1016)
+
+    // A demand root ordered between them is skipped, not woken to hold its slot.
+    expect(calls).toEqual(['a', 'b', 'b', 'a'])
+  })
+
+  it('keeps ordering after a root unregisters', () => {
+    const raf = createRafController()
+    const scheduler = Scheduler.get()
+    const calls: string[] = []
+
+    scheduler.registerRoot('late', { order: 5 })
+    scheduler.registerRoot('early', { order: 1 })
+    const dropMiddle = scheduler.registerRoot('middle', { order: 3 })
+    scheduler.register(() => calls.push('late'), { rootId: 'late' })
+    scheduler.register(() => calls.push('early'), { rootId: 'early' })
+    scheduler.register(() => calls.push('middle'), { rootId: 'middle' })
+
+    raf.flush(1000)
+    expect(calls).toEqual(['early', 'middle', 'late'])
+
+    dropMiddle()
+    raf.flush(1016)
+
+    expect(calls).toEqual(['early', 'middle', 'late', 'early', 'late'])
+  })
+
+  it('orders manual stepping the same way', () => {
+    createRafController()
+    const scheduler = Scheduler.get()
+    const calls: string[] = []
+
+    scheduler.registerRoot('second', { order: 2, frameloop: 'never' })
+    scheduler.registerRoot('first', { order: 1, frameloop: 'never' })
+    scheduler.register(() => calls.push('second'), { rootId: 'second' })
+    scheduler.register(() => calls.push('first'), { rootId: 'first' })
+
+    scheduler.step(1000)
+
+    expect(calls).toEqual(['first', 'second'])
+  })
+
+  it('warns and no-ops when ordering an unknown root', () => {
+    createRafController()
+    const scheduler = Scheduler.get()
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+
+    scheduler.setRootOrder('missing', 3)
+
+    expect(warn).toHaveBeenCalledTimes(1)
+    warn.mockRestore()
+  })
+})

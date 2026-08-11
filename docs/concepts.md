@@ -191,6 +191,17 @@ scheduler.register(updateCharacter, { after: ['physics', 'input'] })
 scheduler.register(earlySetup, { before: ['physics', 'update'] })
 ```
 
+A `before`/`after` target can name either a phase or a job, and when you don't pass an
+explicit `phase` the scheduler resolves it in that order:
+
+1. **A phase** — it generates the ordering slot around it (`before:render`).
+2. **A job id** — the job joins that job's phase, and the two are ordered within it.
+3. **Neither** — it warns and falls back to `update`.
+
+Tier 3 matters if you reference a job that hasn't registered yet, or one in a **different
+root**: job dependencies only resolve within a single root. Order whole roots with
+[`order`](./scheduler.md#setrootorderrootid-order) instead.
+
 ## FPS throttling and frame budget management
 
 Not all work needs 60fps. Expensive operations can run slower without hurting perceived
@@ -218,6 +229,21 @@ When a throttled job misses its window, you choose how it recovers:
 
 On high-refresh displays (120Hz, 144Hz) your every-frame work runs faster while throttled
 jobs stay capped.
+
+### Throttled jobs get their own delta
+
+A throttled job receives the time since **its** last run, not since the last frame. An
+`fps: 30` job in a 60fps loop is handed ~33ms, so `x += delta * speed` moves at the same
+speed whether or not you throttle it:
+
+```ts
+// Both cross the screen at the same rate; one just updates half as often.
+scheduler.register((state, delta) => (x += delta * 100))
+scheduler.register((state, delta) => (y += delta * 100), { fps: 30 })
+```
+
+The delta is measured against the owning root's clock, so it also excludes any time the
+root spent asleep — a throttled job in a demand canvas can't jump on wake either.
 
 ## Frameloop modes
 

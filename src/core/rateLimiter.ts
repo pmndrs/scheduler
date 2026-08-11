@@ -53,8 +53,12 @@ export function shouldRun(job: Job, now: number): boolean {
 }
 
 /**
- * Reset a job's timing state (e.g., when re-enabled)
+ * Reset a job's timing state (e.g., when re-enabled).
+ *
+ * Clears `lastRunElapsed` too, so a resumed job's first delta comes from the
+ * frame rather than billing it for the whole span it was paused.
  */
 export function resetJobTiming(job: Job): void {
   job.lastRun = undefined
+  job.lastRunElapsed = undefined
 }
