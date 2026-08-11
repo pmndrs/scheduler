@@ -1457,3 +1457,169 @@ describe('Scheduler lifecycle hardening', () => {
     expect(scheduler.getJobRootId('nope')).toBeUndefined()
   })
 })
+
+//* Phase 2: Per-root Timing ==============================
+// delta and elapsed belong to the root, not the driver — a sleeping root must
+// not accumulate time it never saw.
+// @see docs/superpowers/plans/2026-08-11-lifecycle-followups.md
+
+describe('Scheduler per-root timing', () => {
+  beforeEach(() => {
+    Scheduler.reset()
+  })
+
+  afterEach(() => {
+    Scheduler.reset()
+    vi.unstubAllGlobals()
+  })
+
+  it('gives an always root the driver frame delta, unchanged', () => {
+    const raf = createRafController()
+    const scheduler = Scheduler.get()
+    const deltas: number[] = []
+
+    scheduler.registerRoot('root', { frameloop: 'always' })
+    scheduler.register((_state, delta) => deltas.push(delta), { rootId: 'root' })
+
+    raf.flush(1000)
+    raf.flush(1016)
+    raf.flush(1032)
+
+    expect(deltas[0]).toBe(0) // first tick has no previous frame
+    expect(deltas[1]).toBeCloseTo(0.016, 5)
+    expect(deltas[2]).toBeCloseTo(0.016, 5)
+  })
+
+  it('caps a waking demand root at one driver frame instead of fast-forwarding', () => {
+    const raf = createRafController()
+    const scheduler = Scheduler.get()
+    const deltas: number[] = []
+
+    scheduler.registerRoot('always', { frameloop: 'always' })
+    scheduler.registerRoot('demand', { frameloop: 'demand' })
+    scheduler.register(() => {}, { rootId: 'always' })
+    scheduler.register((_state, delta) => deltas.push(delta), { rootId: 'demand' })
+
+    scheduler.invalidateRoot('demand')
+    raf.flush(1000)
+
+    // The sibling keeps the driver alive for ~half a second while demand sleeps.
+    for (let frame = 1; frame <= 30; frame++) raf.flush(1000 + frame * 16)
+
+    scheduler.invalidateRoot('demand')
+    raf.flush(1000 + 31 * 16)
+
+    expect(deltas).toHaveLength(2)
+    // 480ms of wall clock passed, but the root resumes rather than jumping.
+    expect(deltas[1]).toBeCloseTo(0.016, 5)
+  })
+
+  it('caps the wake delta whether or not a sibling kept the driver alive', () => {
+    const raf = createRafController()
+    const scheduler = Scheduler.get()
+    const deltas: number[] = []
+
+    scheduler.registerRoot('demand', { frameloop: 'demand' })
+    scheduler.register((_state, delta) => deltas.push(delta), { rootId: 'demand' })
+
+    scheduler.invalidateRoot('demand')
+    raf.flush(1000)
+    expect(scheduler.isRunning).toBe(false) // driver stopped entirely
+
+    scheduler.invalidateRoot('demand')
+    raf.flush(9000) // 8 seconds later
+
+    expect(deltas).toHaveLength(2)
+    expect(deltas[1]).toBeLessThan(0.05) // bounded, no teleport
+    expect(deltas[1]).toBeGreaterThanOrEqual(0)
+  })
+
+  it('accumulates elapsed from the deltas that root actually received', () => {
+    const raf = createRafController()
+    const scheduler = Scheduler.get()
+    let summed = 0
+    let reported = 0
+
+    scheduler.registerRoot('always', { frameloop: 'always' })
+    scheduler.registerRoot('demand', { frameloop: 'demand' })
+    scheduler.register(() => {}, { rootId: 'always' })
+    scheduler.register(
+      (state, delta) => {
+        summed += delta
+        reported = state.elapsed
+      },
+      { rootId: 'demand' },
+    )
+
+    for (let frame = 0; frame < 20; frame++) {
+      if (frame % 5 === 0) scheduler.invalidateRoot('demand')
+      raf.flush(1000 + frame * 16)
+    }
+
+    expect(reported).toBeCloseTo(summed, 10)
+    // Driver ran 20 frames; this root saw 4, so elapsed must not be ~0.32s.
+    expect(reported).toBeLessThan(0.1)
+  })
+
+  it('restores catch-up semantics with maxDelta: Infinity', () => {
+    const raf = createRafController()
+    const scheduler = Scheduler.get()
+    const deltas: number[] = []
+
+    scheduler.registerRoot('always', { frameloop: 'always' })
+    scheduler.registerRoot('demand', { frameloop: 'demand', maxDelta: Infinity })
+    scheduler.register(() => {}, { rootId: 'always' })
+    scheduler.register((_state, delta) => deltas.push(delta), { rootId: 'demand' })
+
+    scheduler.invalidateRoot('demand')
+    raf.flush(1000)
+
+    for (let frame = 1; frame <= 30; frame++) raf.flush(1000 + frame * 16)
+
+    scheduler.invalidateRoot('demand')
+    raf.flush(1000 + 31 * 16)
+
+    // Full wall clock from its own last tick at t=1000 — v9 THREE.Clock behavior.
+    expect(deltas[1]).toBeCloseTo(0.496, 5)
+  })
+
+  it('starts a late-registered root at elapsed 0', () => {
+    const raf = createRafController()
+    const scheduler = Scheduler.get()
+    const elapsed: number[] = []
+
+    scheduler.registerRoot('early', { frameloop: 'always' })
+    scheduler.register(() => {}, { rootId: 'early' })
+    for (let frame = 0; frame < 10; frame++) raf.flush(1000 + frame * 16)
+
+    scheduler.registerRoot('late', { frameloop: 'always' })
+    scheduler.register((state) => elapsed.push(state.elapsed), { rootId: 'late' })
+
+    raf.flush(1000 + 10 * 16)
+    raf.flush(1000 + 11 * 16)
+
+    // Not "how long the app has been running".
+    expect(elapsed[0]).toBe(0)
+    expect(elapsed[1]).toBeCloseTo(0.016, 5)
+  })
+
+  it('carries accumulated time across ambient adoption', () => {
+    const raf = createRafController()
+    const scheduler = Scheduler.get()
+    const elapsed: number[] = []
+
+    scheduler.register((state) => elapsed.push(state.elapsed), { id: 'orphan' })
+    raf.flush(1000)
+    raf.flush(1016)
+    raf.flush(1032)
+
+    const beforeAdoption = elapsed.at(-1)!
+    expect(beforeAdoption).toBeCloseTo(0.032, 5)
+
+    scheduler.registerRoot('host', { frameloop: 'always' })
+    raf.flush(1048)
+
+    // Adoption changes the owning root, not the job's sense of time.
+    expect(elapsed.at(-1)!).toBeCloseTo(beforeAdoption + 0.016, 5)
+  })
+})

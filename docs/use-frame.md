@@ -98,7 +98,7 @@ The callback receives `(state, delta)`:
 interface FrameTimingState {
   time: number // high-resolution RAF timestamp (ms)
   delta: number // seconds since last frame
-  elapsed: number // seconds since first frame
+  elapsed: number // seconds this job's root has been ticking
   frame: number // incrementing frame counter
 }
 ```

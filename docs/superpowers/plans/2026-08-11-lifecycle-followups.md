@@ -192,10 +192,10 @@ Separating _measurement_ from _policy_ fixes both with one mechanism. For an `al
 
 **Interfaces:**
 
-- Produces: `RootOptions.maxDelta?: number` (seconds, default `1 / 60`)
-- Produces: `RootEntry.lastTickTime: number | null`, `RootEntry.accumulatedTime: number`, `RootEntry.maxDelta: number`
+- Produces: `RootOptions.maxDelta?: number` (seconds; default is one driver frame — see the deviation note below)
+- Produces: `RootEntry.lastTickTime: number | null`, `RootEntry.accumulatedTime: number`, `RootEntry.maxDelta: number | undefined`
 
-- [ ] **Step 1:** Compute timing per root in `tickRoot`:
+- [x] **Step 1:** Compute timing per root in `tickRoot`:
 
 ```ts
 const rawDelta = root.lastTickTime === null ? 0 : (timestamp - root.lastTickTime) / 1000
@@ -205,22 +205,30 @@ root.accumulatedTime += delta
 // frameState: { time: timestamp, delta, elapsed: root.accumulatedTime, frame: this.loopState.frameCount }
 ```
 
-- [ ] **Step 2:** Keep the shared `loopState` update in `executeFrame` — `time` and `frame` stay driver-scoped. Only `delta` and `elapsed` become per-root.
-- [ ] **Step 3:** Reset `lastTickTime` to `null` on `registerRoot` and after ambient adoption, so a fresh root's first frame is `0` rather than a huge diff.
-- [ ] **Step 4:** Apply the same per-root computation in the `stepJob` path.
-- [ ] **Step 5:** Document the default in `docs/concepts.md`: sleeping roots do not accumulate time; a waking demand root receives at most `maxDelta`. Raising `maxDelta` restores v9-style catch-up; `Infinity` reproduces `THREE.Clock.getDelta()` exactly.
-- [ ] **Step 6:** Tests — an `always` root's deltas are unchanged from current behavior; a waking demand root gets the same delta whether or not a sibling is running; `elapsed` equals the sum of the deltas that root received; `maxDelta: Infinity` restores catch-up.
+- [x] **Step 2:** Keep the shared `loopState` update in `executeFrame` — `time` and `frame` stay driver-scoped. Only `delta` and `elapsed` become per-root.
+- [x] **Step 3:** Reset `lastTickTime` to `null` on `registerRoot` and after ambient adoption, so a fresh root's first frame is `0` rather than a huge diff.
+- [x] **Step 4:** Apply the same per-root computation in the `stepJob` path.
+- [x] **Step 5:** Document the default in `docs/concepts.md`: sleeping roots do not accumulate time; a waking demand root receives at most `maxDelta`. Raising `maxDelta` restores v9-style catch-up; `Infinity` reproduces `THREE.Clock.getDelta()` exactly.
+- [x] **Step 6:** Tests — an `always` root's deltas are unchanged from current behavior; a waking demand root gets the same delta whether or not a sibling is running; `elapsed` equals the sum of the deltas that root received; `maxDelta: Infinity` restores catch-up. Plus: a late-registered root starts at `elapsed` 0, and adoption carries the ambient clock across.
 
-### Task 7: Pause compensation sign and frame-count caveat
+> **Deviation 1 — the default cap cannot be a constant.** The plan said `maxDelta` defaults to `1 / 60`, which is wrong: at 60Hz a real frame is often marginally _over_ 16.67ms, and on a 30Hz display every frame is 33ms. A constant default would clamp ordinary frames and halve animation speed on slower displays. The default is now **one driver frame** (`root.maxDelta ?? driverDelta`), which self-tunes to the refresh rate and is exactly the driver delta for any root that runs every frame — so the common path is provably unchanged. An explicit number still opts into bounded catch-up, `Infinity` into wall-clock.
+>
+> **Deviation 2 — `startLoop` no longer seeds `lastTime` from `performance.now()`.** Found by a failing test: after a full driver stop, the first frame's driver delta was measured between `performance.now()` at start and whatever timestamp the driver was fed. Those agree for RAF in a browser but not for injected timestamps, and the bogus interval became a bogus delta cap — a waking root teleported 8s in the test. `lastTime` now starts `null`, so the first frame after any (re)start reports a zero driver delta. This also makes the stopped-span exclusion exact instead of approximate.
+>
+> **Note on `stepJob`.** It reports a per-root delta but deliberately does **not** commit `lastTickTime` / `accumulatedTime`: stepping one job in isolation must not advance the root's frame clock and shrink the delta its next real frame receives. Its `elapsed` was also in milliseconds while `tickRoot`'s was in seconds; both are now seconds.
+
+### Task 7: Pause compensation and frame-count caveat
 
 **Files:**
 
-- Modify: `src/core/scheduler.ts`
-- Modify: `docs/scheduler.md`
-- Test: `tests/scheduler.test.ts`
+- Modify: `src/core/scheduler.ts`, `src/types.ts`
+- Modify: `docs/scheduler.md`, `docs/concepts.md`
 
-- [ ] **Step 1:** Fix `startLoop`'s pause compensation. `createdAt - (performance.now() - stoppedTime)` subtracts the paused span where it should add it, so `elapsed` over-counts by twice the pause. Only `stepJob` reads `createdAt`, but the branch makes stop/start far more frequent.
-- [ ] **Step 2:** Document that `state.frame` is driver-scoped and resets whenever the RAF restarts, so it is not a stable per-root frame counter in demand-heavy apps. No code change — `frame` is noise only in multi-root start/stop systems, which is acceptable.
+- [x] **Step 1:** ~~Fix the sign~~ **Removed the machinery instead.** The plan called for fixing `createdAt - (performance.now() - stoppedTime)`, which subtracts the paused span where it should add it. But once Task 6 landed, `stepJob` — the only reader of `createdAt` — takes its elapsed from the root, leaving `createdAt` and `stoppedTime` written but never read. Fixing the sign of a value nothing observes would have produced untestable code, so both fields are gone from `FrameLoopState` and `startLoop`. Per-root accumulation excludes stopped spans by construction, which is what the compensation was approximating.
+- [x] **Step 2:** Documented in `docs/concepts.md` that `frame` is a driver-scoped marker that resets when the RAF restarts, and shouldn't be used to derive state in demand-heavy apps. No code change, per your call that this is acceptable noise.
+- [x] **Step 3 (added):** `resetTiming()` now also clears every root's `lastTickTime` and `accumulatedTime`. Without it the method no longer did what its name promises, since the timing it used to reset had moved onto the roots.
+
+> **Left in place:** `loopState.elapsedTime` is still maintained but is no longer read by frame state. Kept as the driver's own running time — `resetTiming` documents it, and it is the natural surface for any future driver-level introspection. Flagged here so it isn't mistaken for an oversight.
 
 ---
 

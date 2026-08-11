@@ -252,7 +252,42 @@ scheduler.step() // manually advances every root once
 ```
 
 `start()` and `stop()` are low-level overrides. An explicit `start()` runs every root
-continuously until `stop()` is called.
+continuously until `stop()` is called, and `stop()` holds the driver stopped — root
+registration and mode changes won't restart it, only `start()` or an invalidation.
+
+## Timing
+
+`time` and `frame` come from the driver: every root running on the same animation frame
+sees the same values.
+
+`delta` and `elapsed` belong to the **root**. A root that sleeps doesn't accumulate time it
+never saw, so `elapsed` is always the sum of the deltas that root actually received — not
+how long the app has been running. A canvas that mounts ten seconds in starts at zero.
+
+For a root that runs every frame — the common case — `delta` is exactly the driver's frame
+delta, unchanged. The difference only shows up when a root skips frames:
+
+```ts
+// Off-screen for 8 seconds, then invalidated.
+scheduler.invalidateRoot('hero')
+// delta is ~0.016, not 8. The animation resumes; it doesn't jump forward.
+```
+
+That cap defaults to one driver frame, which self-tunes across refresh rates. Raise it per
+root to allow bounded catch-up, or opt into true wall-clock deltas:
+
+```ts
+scheduler.registerRoot('sim', { frameloop: 'demand', maxDelta: 0.1 }) // catch up, bounded
+scheduler.registerRoot('clock', { frameloop: 'demand', maxDelta: Infinity }) // wall clock
+```
+
+Pick `Infinity` when a root models real elapsed time (a simulation that must stay in sync
+with the wall clock) and the default when it drives animation, where a jump reads as a
+glitch.
+
+> `frame` counts driver frames and resets whenever the RAF restarts, so it is a frame
+> _marker_, not a stable per-root counter. In demand-heavy apps that start and stop the
+> driver often, don't derive state from it.
 
 ## A real game loop
 

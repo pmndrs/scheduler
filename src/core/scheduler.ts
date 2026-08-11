@@ -123,9 +123,7 @@ export class Scheduler {
     lastTime: null, // null = uninitialized, 0+ = valid timestamp
     frameCount: 0,
     elapsedTime: 0,
-    createdAt: performance.now(),
   }
-  private stoppedTime: number = 0
 
   //* Private State ================================
 
@@ -233,6 +231,9 @@ export class Scheduler {
       needsRebuild: false,
       frameloop: options.frameloop ?? this._frameloop,
       pendingFrames: 0,
+      lastTickTime: null,
+      accumulatedTime: 0,
+      maxDelta: options.maxDelta,
     }
 
     // Bind error handler from root
@@ -288,7 +289,14 @@ export class Scheduler {
       }
       hostRoot.jobs.set(jobId, job)
     }
-    if (ambient.jobs.size > 0) hostRoot.needsRebuild = true
+    if (ambient.jobs.size > 0) {
+      hostRoot.needsRebuild = true
+      // Carry the ambient clock across. Adoption changes which root owns a job,
+      // not the job's sense of time — resetting would snap any elapsed-driven
+      // animation that had been running standalone.
+      hostRoot.lastTickTime = ambient.lastTickTime
+      hostRoot.accumulatedTime = ambient.accumulatedTime
+    }
 
     // Clear ambient's jobs BEFORE unregister so its teardown doesn't delete the
     // jobStateListeners we just migrated, then drop the now-empty ambient root.
@@ -698,21 +706,20 @@ export class Scheduler {
    */
   private startLoop(): void {
     if (this.loopState.running) return
-    const { elapsedTime, createdAt } = this.loopState
-    let adjustedCreated = 0
 
-    // if we were stopped, the elapsed time will explode, so we need to subtract
-    // the time we were stopped for from the START time. Old elapsed will persist
-    if (this.stoppedTime > 0) {
-      adjustedCreated = createdAt - (performance.now() - this.stoppedTime)
-      this.stoppedTime = 0
-    }
-
+    // lastTime starts null so the first frame after a (re)start reports a zero
+    // driver delta. Seeding it from performance.now() assumed that clock agrees
+    // with the timestamps the driver is fed, which holds for RAF in a browser but
+    // not for injected timestamps — and a bogus interval there becomes a bogus
+    // delta cap, letting a waking root teleport.
+    //
+    // No pause compensation needed either: elapsed time is accumulated per root
+    // from the deltas it actually received, so a stopped span is excluded by
+    // construction rather than subtracted after the fact.
     Object.assign(this.loopState, {
       running: true,
-      elapsedTime: elapsedTime ?? 0,
-      lastTime: performance.now(),
-      createdAt: adjustedCreated > 0 ? adjustedCreated : performance.now(),
+      elapsedTime: this.loopState.elapsedTime ?? 0,
+      lastTime: null,
       frameCount: 0,
       rafHandle: requestAnimationFrame(this.loop),
     })
@@ -748,7 +755,6 @@ export class Scheduler {
       cancelAnimationFrame(this.loopState.rafHandle)
       this.loopState.rafHandle = null
     }
-    this.stoppedTime = performance.now()
   }
 
   /**
@@ -833,14 +839,19 @@ export class Scheduler {
 
   /**
    * Reset timing state for deterministic testing.
-   * Preserves jobs and roots but resets lastTime, frameCount, elapsedTime, etc.
+   * Preserves jobs and roots but clears the driver's frame counters and every
+   * root's accumulated time, so the next frame starts from zero.
    * @returns {void}
    */
   resetTiming(): void {
     this.loopState.lastTime = null
     this.loopState.frameCount = 0
     this.loopState.elapsedTime = 0
-    this.loopState.createdAt = performance.now()
+
+    for (const root of this.roots.values()) {
+      root.lastTickTime = null
+      root.accumulatedTime = 0
+    }
   }
 
   //* Manual Stepping Methods ================================
@@ -905,16 +916,17 @@ export class Scheduler {
     }
 
     const now = timestamp ?? performance.now()
-    const deltaMs = this.loopState.lastTime !== null ? now - this.loopState.lastTime : 0
-    const delta = deltaMs / 1000 // Convert to seconds
-    const elapsed = now - this.loopState.createdAt
+    const driverDelta = this.loopState.lastTime !== null ? (now - this.loopState.lastTime) / 1000 : 0
+    // Reported, not committed: stepping one job in isolation must not advance the
+    // root's frame clock and shrink the delta its next real frame receives.
+    const delta = this.computeRootDelta(root, now, driverDelta)
     const providedState = root.getState?.() ?? {}
 
     const frameState = {
       ...providedState,
       time: now,
       delta,
-      elapsed,
+      elapsed: root.accumulatedTime,
       frame: this.loopState.frameCount,
     } as FrameNextState
 
@@ -1016,25 +1028,30 @@ export class Scheduler {
    * Errors are caught and propagated via triggerError.
    * @param {RootEntry} root - The root entry to tick
    * @param {number} timestamp - RAF timestamp in milliseconds
-   * @param {number} delta - Time since last frame in seconds
+   * @param {number} driverDelta - Time since the driver's last frame in seconds
    * @returns {void}
    * @private
    */
-  private tickRoot(root: RootEntry, timestamp: number, delta: number): void {
+  private tickRoot(root: RootEntry, timestamp: number, driverDelta: number): void {
     // Rebuild if needed
     if (root.needsRebuild) {
       root.sortedJobs = rebuildSortedJobs(root.jobs, this.phaseGraph)
       root.needsRebuild = false
     }
 
+    const delta = this.computeRootDelta(root, timestamp, driverDelta)
+    root.lastTickTime = timestamp
+    root.accumulatedTime += delta
+
     const providedState = root.getState?.() ?? {}
 
-    // Build frame state (elapsed converted to seconds for user-facing API)
+    // Build frame state. delta/elapsed belong to this root; time/frame are the
+    // driver's, shared by every root running on the same frame.
     const frameState = {
       ...providedState,
       time: timestamp,
       delta,
-      elapsed: this.loopState.elapsedTime / 1000, // Convert ms to seconds
+      elapsed: root.accumulatedTime,
       frame: this.loopState.frameCount,
     } as FrameNextState
 
@@ -1050,6 +1067,28 @@ export class Scheduler {
         this.triggerError(error instanceof Error ? error : new Error(String(error)))
       }
     }
+  }
+
+  /**
+   * Compute the delta a root should receive this tick.
+   *
+   * Measured from the root's own last tick, so a root that skipped frames isn't
+   * told it ran continuously — then capped, so one that slept resumes instead of
+   * fast-forwarding. The cap defaults to a single driver frame, which makes this
+   * identical to the driver delta for any root that runs every frame, and
+   * self-tunes across refresh rates. `maxDelta: Infinity` opts into wall-clock
+   * catch-up.
+   * @param {RootEntry} root - The root about to tick
+   * @param {number} timestamp - Frame timestamp in milliseconds
+   * @param {number} driverDelta - Time since the driver's last frame in seconds
+   * @returns {number} Delta in seconds, never negative
+   * @private
+   */
+  private computeRootDelta(root: RootEntry, timestamp: number, driverDelta: number): number {
+    if (root.lastTickTime === null) return 0
+
+    const rawDelta = (timestamp - root.lastTickTime) / 1000
+    return Math.max(0, Math.min(rawDelta, root.maxDelta ?? driverDelta))
   }
 
   /**

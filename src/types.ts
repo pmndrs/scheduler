@@ -89,6 +89,15 @@ export interface RootOptions {
   onError?: (error: Error) => void
   /** Root frame policy. Defaults to the scheduler's current frameloop setting. */
   frameloop?: Frameloop
+  /**
+   * Largest delta (in seconds) this root's callbacks can receive, capping how far
+   * it catches up after skipping frames.
+   *
+   * Defaults to one driver frame, so a root that slept resumes where it left off
+   * instead of fast-forwarding. Raise it to allow bounded catch-up, or set
+   * `Infinity` for true wall-clock deltas (v9 `THREE.Clock` behavior).
+   */
+  maxDelta?: number
 }
 
 //* Controls returned from useFrame --------------------------------
@@ -254,10 +263,11 @@ export interface FrameLoopState {
   lastTime: number | null
   /** Frame counter */
   frameCount: number
-  /** Elapsed time since first frame in ms */
+  /**
+   * Driver running time in ms. Not what callbacks receive — frame state carries
+   * the owning root's own accumulated time, which excludes frames it slept through.
+   */
   elapsedTime: number
-  /** createdAt timestamp in ms */
-  createdAt: number
 }
 
 /**
@@ -279,6 +289,12 @@ export interface RootEntry {
   frameloop: Frameloop
   /** Demand frames waiting to be executed */
   pendingFrames: number
+  /** Timestamp of this root's last tick in ms (null = never ticked) */
+  lastTickTime: number | null
+  /** Sum of the deltas this root has received, in seconds */
+  accumulatedTime: number
+  /** Delta cap in seconds. undefined = one driver frame */
+  maxDelta: number | undefined
 }
 
 /**

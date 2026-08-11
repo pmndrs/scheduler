@@ -159,6 +159,7 @@ interface RootOptions {
   getState?: () => any // state provider merged into the frame state
   onError?: (error: Error) => void // job error handler (default: console.error)
   frameloop?: 'always' | 'demand' | 'never' // defaults to scheduler.frameloop
+  maxDelta?: number // delta cap in seconds; defaults to one driver frame
 }
 ```
 
@@ -176,8 +177,11 @@ scheduler.registerRoot('standalone')
 
 - `getState` is how a host injects its own state (r3f injects its `RootState`). Whatever it
   returns is spread into the object passed to every job callback, alongside timing.
-- Roots share timing and one RAF driver, but their mode and pending demand frames are
-  independent.
+- Roots share one RAF driver and its `time` / `frame`, but their mode, pending demand
+  frames, `delta`, and `elapsed` are independent — a sleeping root doesn't accumulate time
+  it never saw. `maxDelta` caps how far a root catches up after skipping frames; the default
+  of one driver frame means a waking root resumes rather than jumping. See
+  [Timing](./concepts.md#timing).
 - The last root to unregister stops the loop.
 
 ### `setRootFrameloop(rootId, mode)`
@@ -439,8 +443,8 @@ by the frame currently executing. Calls for always and never roots are no-ops.
 
 ### `resetTiming()`
 
-Reset `lastTime`, `frameCount`, and `elapsedTime` without touching jobs or roots. Mostly
-for deterministic tests.
+Reset the driver's frame counters and every root's accumulated time, without touching jobs
+or roots themselves. Mostly for deterministic tests.
 
 ---
 
@@ -575,7 +579,7 @@ type Frameloop = 'always' | 'demand' | 'never'
 interface FrameTimingState {
   time: number // high-res RAF timestamp (ms)
   delta: number // seconds since last frame
-  elapsed: number // seconds since first frame
+  elapsed: number // seconds this root has been ticking (sleeping roots don't accrue)
   frame: number // incrementing counter
 }
 
