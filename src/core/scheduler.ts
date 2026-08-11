@@ -138,6 +138,8 @@ export class Scheduler {
   private jobStateListeners: Map<string, Set<() => void>> = new Map()
   private _frameloop: Frameloop = 'always'
   private forceRunning: boolean = false
+  private paused: boolean = false
+  private warnedBulkFrameloop: boolean = false
 
   //* Error Handling & Root-Ready State ================================
 
@@ -150,11 +152,29 @@ export class Scheduler {
     return this.phaseGraph.getOrderedPhases()
   }
 
+  /**
+   * Legacy bulk control. Reading returns the default applied to roots registered
+   * later; writing sets that default AND applies the mode to every existing root.
+   *
+   * With more than one root this is last-writer-wins across hosts — prefer
+   * {@link Scheduler.setRootFrameloop} for per-root control and
+   * {@link Scheduler.defaultFrameloop} to change only the default.
+   */
   get frameloop(): Frameloop {
     return this._frameloop
   }
 
   set frameloop(mode: Frameloop) {
+    // Warn once, not per call: hosts commonly write this on every render, so a
+    // per-call warning would flood the console.
+    if (this.roots.size > 1 && !this.warnedBulkFrameloop) {
+      this.warnedBulkFrameloop = true
+      console.warn(
+        `[Scheduler] scheduler.frameloop applied to ${this.roots.size} roots. ` +
+          `Use setRootFrameloop(rootId, mode) for per-root control.`,
+      )
+    }
+
     this._frameloop = mode
 
     for (const root of this.roots.values()) {
@@ -162,6 +182,18 @@ export class Scheduler {
     }
 
     this.reconcileLoop()
+  }
+
+  /**
+   * The mode given to roots that register without an explicit `frameloop`.
+   * Unlike {@link Scheduler.frameloop}, setting this leaves existing roots alone.
+   */
+  get defaultFrameloop(): Frameloop {
+    return this._frameloop
+  }
+
+  set defaultFrameloop(mode: Frameloop) {
+    this._frameloop = mode
   }
 
   get isRunning(): boolean {
@@ -282,9 +314,12 @@ export class Scheduler {
 
     this.roots.delete(id)
 
-    // Last root stops the loop and clears error handler
+    // Last root stops the loop and clears error handler.
+    // Uses stopLoop() rather than stop(): teardown must not latch the paused
+    // flag, or a later root registration would silently stay frozen.
     if (this.roots.size === 0) {
-      this.stop()
+      this.forceRunning = false
+      this.stopLoop()
       // Clear error handler to avoid stale references when new roots register
       // @see https://github.com/pmndrs/react-three-fiber/issues/3651
       this.errorHandler = null
@@ -532,7 +567,7 @@ export class Scheduler {
    */
   unregister(id: string, rootId?: string): void {
     // Find the root containing this job
-    const root = rootId ? this.roots.get(rootId) : Array.from(this.roots.values()).find((r) => r.jobs.has(id))
+    const root = rootId ? this.roots.get(rootId) : this.findRootForJob(id)
 
     if (root?.jobs.delete(id)) {
       root.needsRebuild = true
@@ -550,16 +585,8 @@ export class Scheduler {
    */
   updateJob(id: string, options: Partial<JobOptions>): void {
     // Find the job across all roots
-    let job: Job | undefined
-    let root: RootEntry | undefined
-
-    for (const r of this.roots.values()) {
-      job = r.jobs.get(id)
-      if (job) {
-        root = r
-        break
-      }
-    }
+    const root = this.findRootForJob(id)
+    const job = root?.jobs.get(id)
 
     if (!job || !root) return
 
@@ -592,11 +619,8 @@ export class Scheduler {
    * @returns {boolean} True if the job exists and is paused
    */
   isJobPaused(id: string): boolean {
-    for (const root of this.roots.values()) {
-      const job = root.jobs.get(id)
-      if (job) return !job.enabled
-    }
-    return false
+    const job = this.findRootForJob(id)?.jobs.get(id)
+    return job ? !job.enabled : false
   }
 
   /**
@@ -656,11 +680,13 @@ export class Scheduler {
   //* Frame Loop Control Methods ================================
 
   /**
-   * Force the requestAnimationFrame loop to run continuously for every root.
+   * Force the requestAnimationFrame loop to run continuously for every root,
+   * clearing any paused state from a previous {@link Scheduler.stop}.
    * Root lifecycle modes resume control after stop() or the last root is removed.
    * @returns {void}
    */
   start(): void {
+    this.paused = false
     this.forceRunning = true
     this.startLoop()
   }
@@ -693,12 +719,18 @@ export class Scheduler {
   }
 
   /**
-   * Stop the requestAnimationFrame loop.
-   * Cancels any pending RAF callback.
-   * No-op if not running.
+   * Stop the requestAnimationFrame loop and hold it stopped.
+   *
+   * Root lifecycle events — registration, unregistration, and mode changes —
+   * will NOT restart the driver while stopped. Only an explicit
+   * {@link Scheduler.start}, {@link Scheduler.invalidate}, or
+   * {@link Scheduler.invalidateRoot} resumes it, since those are direct requests
+   * for frames. Manual {@link Scheduler.step} / {@link Scheduler.stepRoot} still
+   * work while stopped.
    * @returns {void}
    */
   stop(): void {
+    this.paused = true
     this.forceRunning = false
     this.stopLoop()
   }
@@ -732,7 +764,9 @@ export class Scheduler {
       return
     }
 
-    if (!this.applyRootFrameloop(root, mode)) return
+    // Always reconcile, even when the mode is unchanged, so this can never leave
+    // the driver out of sync with aggregate root state.
+    this.applyRootFrameloop(root, mode)
     this.reconcileLoop()
   }
 
@@ -769,7 +803,11 @@ export class Scheduler {
       invalidated = true
     }
 
-    if (invalidated) this.reconcileLoop()
+    if (!invalidated) return
+
+    // An explicit frame request overrides a previous stop().
+    this.paused = false
+    this.reconcileLoop()
   }
 
   /**
@@ -788,6 +826,8 @@ export class Scheduler {
     if (root.frameloop !== 'demand') return
 
     this.requestRootFrames(root, frames, stackFrames)
+    // An explicit frame request overrides a previous stop().
+    this.paused = false
     this.reconcileLoop()
   }
 
@@ -821,6 +861,33 @@ export class Scheduler {
   }
 
   /**
+   * Manually execute a single frame for ONE root, leaving its siblings untouched.
+   *
+   * This is the targeted form of {@link Scheduler.step}, for hosts driving a
+   * `never` root from their own loop (e.g. a WebXR animation loop) while other
+   * roots stay on the shared RAF driver — stepping all roots there would tick
+   * those siblings twice per frame.
+   *
+   * Like `step()`, it runs global before/after jobs and does NOT consume a
+   * pending demand frame.
+   * @param {string} rootId - The root to execute
+   * @param {number} [timestamp] - Optional timestamp (defaults to performance.now())
+   * @returns {void}
+   * @example
+   * scheduler.registerRoot('xr', { frameloop: 'never' })
+   * renderer.xr.setAnimationLoop((time) => scheduler.stepRoot('xr', time))
+   */
+  stepRoot(rootId: string, timestamp?: number): void {
+    const root = this.roots.get(rootId)
+    if (!root) {
+      console.warn(`[Scheduler] Root "${rootId}" not found; step ignored.`)
+      return
+    }
+
+    this.executeFrame(timestamp ?? performance.now(), [root])
+  }
+
+  /**
    * Manually execute a single job by its ID.
    * Useful for testing individual job callbacks in isolation.
    * @param {string} id - The job ID to step
@@ -829,16 +896,8 @@ export class Scheduler {
    */
   stepJob(id: string, timestamp?: number): void {
     // Find the job and its root
-    let job: Job | undefined
-    let root: RootEntry | undefined
-
-    for (const r of this.roots.values()) {
-      job = r.jobs.get(id)
-      if (job) {
-        root = r
-        break
-      }
-    }
+    const root = this.findRootForJob(id)
+    const job = root?.jobs.get(id)
 
     if (!job || !root) {
       console.warn(`[Scheduler] Job "${id}" not found`)
@@ -893,16 +952,23 @@ export class Scheduler {
   }
 
   /**
-   * Execute a single frame across all roots.
+   * Execute a single frame across a selection of roots.
    * Order: globalBefore → each root's jobs → globalAfter
    * @param {number} timestamp - RAF timestamp in milliseconds
+   * @param {'all' | 'automatic' | RootEntry[]} [execution] - Which roots run:
+   *   every root, only those with automatic work, or an explicit list.
    * @returns {void}
    * @private
    */
-  private executeFrame(timestamp: number, execution: 'all' | 'automatic' = 'all'): void {
+  private executeFrame(timestamp: number, execution: 'all' | 'automatic' | RootEntry[] = 'all'): void {
     // Snapshot root eligibility at the frame boundary so callback invalidations
     // cannot make later roots run in the same frame based on registration order.
-    const frameRoots = execution === 'automatic' ? this.collectAutomaticRoots() : Array.from(this.roots.values())
+    const frameRoots =
+      execution === 'automatic'
+        ? this.collectAutomaticRoots()
+        : execution === 'all'
+          ? Array.from(this.roots.values())
+          : execution
 
     // Update timing (RAF provides ms, convert delta to seconds for consistency with legacy THREE.Clock)
     // Handle first frame case where lastTime is null - use timestamp as base (delta = 0)
@@ -988,6 +1054,12 @@ export class Scheduler {
 
   /**
    * Apply a root mode without reconciling the shared driver.
+   *
+   * Entering demand does NOT grant a frame: a demand root draws only when
+   * invalidated, whether it was registered in demand mode or switched into it.
+   * Hosts that need a frame on the transition should call
+   * {@link Scheduler.invalidateRoot} themselves. Leaving demand clears pending
+   * frames so stale work can't run on a later return.
    * @param {RootEntry} root - Root to update
    * @param {Frameloop} mode - New frame policy
    * @returns {boolean} Whether the root changed
@@ -1055,10 +1127,13 @@ export class Scheduler {
 
   /**
    * Start or stop the shared RAF driver from aggregate root state.
+   * No-op while paused by an explicit {@link Scheduler.stop}, so routine
+   * lifecycle events can't silently resurrect a stopped driver.
    * @returns {void}
    * @private
    */
   private reconcileLoop(): void {
+    if (this.paused) return
     if (this.forceRunning || this.hasAutomaticWork()) this.startLoop()
     else this.stopLoop()
   }
@@ -1102,6 +1177,36 @@ export class Scheduler {
   }
 
   /**
+   * Get all registered root IDs in registration order.
+   * @returns {string[]} Array of root IDs
+   */
+  getRootIds(): string[] {
+    return Array.from(this.roots.keys())
+  }
+
+  /**
+   * Read one root's lifecycle mode.
+   * @param {string} rootId - The root to inspect
+   * @returns {Frameloop | undefined} The mode, or undefined if the root is unknown
+   */
+  getRootFrameloop(rootId: string): Frameloop | undefined {
+    return this.roots.get(rootId)?.frameloop
+  }
+
+  /**
+   * Find which root currently owns a job.
+   *
+   * Resolve this at call time rather than caching it: ambient-root adoption
+   * moves jobs between roots, so an id captured at registration goes stale.
+   * @param {string} jobId - The job to look up
+   * @returns {string | undefined} The owning root ID, or undefined if not found
+   * @see docs/design/ambient-root.md
+   */
+  getJobRootId(jobId: string): string | undefined {
+    return this.findRootForJob(jobId)?.id
+  }
+
+  /**
    * Check if any user (non-system) jobs are registered in a specific phase.
    * Used by the default render job to know if a user has taken over rendering.
    *
@@ -1124,6 +1229,19 @@ export class Scheduler {
   }
 
   //* Utility Methods ================================
+
+  /**
+   * Find the root entry containing a job.
+   * @param {string} jobId - The job ID to search for
+   * @returns {RootEntry | undefined} The owning root, or undefined if not found
+   * @private
+   */
+  private findRootForJob(jobId: string): RootEntry | undefined {
+    for (const root of this.roots.values()) {
+      if (root.jobs.has(jobId)) return root
+    }
+    return undefined
+  }
 
   /**
    * Generate a unique root ID for automatic root registration.

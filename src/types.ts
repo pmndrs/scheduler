@@ -99,10 +99,20 @@ export interface FrameControls {
   id: string
   /** Access to the global scheduler for frame loop control */
   scheduler: SchedulerApi
+  /**
+   * The root that currently owns this job, or undefined if it isn't registered.
+   * Resolved on access, because host adoption can move a job between roots.
+   */
+  readonly rootId: string | undefined
   /** Manually step this job only (bypasses FPS limiting) */
   step(timestamp?: number): void
   /** Manually step ALL jobs in the scheduler */
   stepAll(timestamp?: number): void
+  /**
+   * Request frames for the root that owns this job. No-op when that root isn't
+   * in demand mode, or when this job isn't registered to a root.
+   */
+  invalidate(frames?: number, stackFrames?: boolean): void
   /** Pause this job (set enabled=false) */
   pause(): void
   /** Resume this job (set enabled=true) */
@@ -128,6 +138,9 @@ export interface SchedulerApi {
   unregisterRoot(id: string): void
   generateRootId(): string
   getRootCount(): number
+  getRootIds(): string[]
+  getRootFrameloop(rootId: string): Frameloop | undefined
+  getJobRootId(jobId: string): string | undefined
   readonly isReady: boolean
   onRootReady(callback: () => void): () => void
 
@@ -152,10 +165,12 @@ export interface SchedulerApi {
   stop(): void
   readonly isRunning: boolean
   frameloop: Frameloop
+  defaultFrameloop: Frameloop
   setRootFrameloop(rootId: string, mode: Frameloop): void
 
   //* Manual Stepping
   step(timestamp?: number): void
+  stepRoot(rootId: string, timestamp?: number): void
   stepJob(id: string, timestamp?: number): void
   invalidate(frames?: number, stackFrames?: boolean): void
   invalidateRoot(rootId: string, frames?: number, stackFrames?: boolean): void

@@ -138,14 +138,29 @@ interface UseFrameOptions {
 ```ts
 interface FrameControls {
   id: string // the job's id
+  rootId: string | undefined // the root that owns this job (resolved on access)
   scheduler: Scheduler // the global scheduler
   step(timestamp?: number): void // step this job only (bypasses FPS limiting)
   stepAll(timestamp?: number): void // step ALL jobs once
+  invalidate(frames?, stackFrames?): void // request frames for THIS job's root
   pause(): void // pause this job
   resume(): void // resume this job
   isPaused: boolean // reactive — re-renders on pause/resume
 }
 ```
+
+`invalidate()` wakes only the root this job belongs to, leaving sibling roots asleep — the
+root-scoped counterpart to `scheduler.invalidate()`, which fans out to every demand root:
+
+```tsx
+const { invalidate } = useFrame(() => drawChart())
+// later, when the data changes:
+invalidate()
+```
+
+`rootId` is read fresh on every access rather than captured at registration, because a host
+adopts standalone jobs when it registers — see [ambient root](./design/ambient-root.md). It
+is `undefined` when the hook is called without a callback, since no job is registered.
 
 ## Examples
 

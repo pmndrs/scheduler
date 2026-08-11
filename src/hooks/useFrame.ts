@@ -24,7 +24,7 @@ import type { FrameCallback, FrameTimingState, UseFrameOptions, FrameControls } 
  *
  * @param callback - Function called each frame with (state, delta). Optional if you only need scheduler access.
  * @param priorityOrOptions - Either a priority number (shorthand for `{ priority }`) or an options object
- * @returns Controls object with step(), stepAll(), pause(), resume(), isPaused, id, scheduler
+ * @returns Controls object with step(), stepAll(), invalidate(), pause(), resume(), isPaused, id, rootId, scheduler
  *
  * @example
  * // Phase-based ordering
@@ -110,6 +110,15 @@ export function useFrame<T = FrameTimingState>(
       id,
       /** Access to the global scheduler for frame loop control */
       scheduler: scheduler as Scheduler,
+      /**
+       * The root that currently owns this job. Resolved on every access rather
+       * than captured at registration, because a host adopts ambient jobs when
+       * it registers — an id captured earlier would go stale.
+       * @see docs/design/ambient-root.md
+       */
+      get rootId() {
+        return getScheduler().getJobRootId(id)
+      },
       /** Manually step this job only (bypasses FPS limiting) */
       step: (timestamp?: number) => {
         getScheduler().stepJob(id, timestamp)
@@ -117,6 +126,12 @@ export function useFrame<T = FrameTimingState>(
       /** Manually step ALL jobs in the scheduler (useful for frameloop='never') */
       stepAll: (timestamp?: number) => {
         getScheduler().step(timestamp)
+      },
+      /** Request frames for this job's own root, leaving sibling roots asleep */
+      invalidate: (frames?: number, stackFrames?: boolean) => {
+        const scheduler = getScheduler()
+        const rootId = scheduler.getJobRootId(id)
+        if (rootId) scheduler.invalidateRoot(rootId, frames, stackFrames)
       },
       /** Pause this job (set enabled=false) */
       pause: () => {

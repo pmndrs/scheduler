@@ -205,6 +205,22 @@ Returns a unique id like `'root_0'`.
 
 Number of registered roots.
 
+### `getRootIds(): string[]`
+
+All registered root ids, in registration order.
+
+### `getRootFrameloop(rootId): Frameloop | undefined`
+
+One root's current mode, or `undefined` if the root is unknown. Since `scheduler.frameloop`
+only reports the default for new roots, this is how you ask what a specific root is doing.
+
+### `getJobRootId(jobId): string | undefined`
+
+Which root currently owns a job, or `undefined` if it isn't registered.
+
+Resolve this at call time rather than caching it — a host adopts ambient jobs when it
+registers, so an id captured earlier goes stale. @see [ambient root](./design/ambient-root.md)
+
 ---
 
 ## Job registration
@@ -342,13 +358,25 @@ const unsub = scheduler.subscribeJobState('my-job', () => {
 ### `start()` / `stop()`
 
 Explicitly override the automatic root lifecycle. `start()` runs every root continuously;
-`stop()` cancels that override and the active RAF. Normal root registration, mode changes,
-and invalidation automatically manage the driver without requiring these methods.
+`stop()` cancels that override and holds the driver stopped. Normal root registration, mode
+changes, and invalidation automatically manage the driver without requiring these methods.
 
 ```ts
 scheduler.start()
 scheduler.stop()
 ```
+
+`stop()` is sticky. Routine lifecycle events — a root registering, unregistering, or
+changing mode — will **not** restart the driver while stopped, so a paused app stays paused
+when a new host mounts. What does resume it:
+
+| Action                                  | Resumes?                             |
+| --------------------------------------- | ------------------------------------ |
+| `start()`                               | yes                                  |
+| `invalidate()` / `invalidateRoot()`     | yes — an explicit request for frames |
+| `registerRoot()` / `setRootFrameloop()` | no                                   |
+| `scheduler.frameloop = …`               | no                                   |
+| `step()` / `stepRoot()`                 | runs the frame, driver stays stopped |
 
 ### `isRunning` (getter): `boolean`
 
@@ -365,8 +393,21 @@ scheduler.frameloop = 'demand'
 - `'never'` — run during manual stepping.
 
 This property is the compatibility bulk control: setting it updates every existing root
-and sets the default for roots registered later. The getter returns that default. Use
-`setRootFrameloop` when roots need different modes.
+and sets the default for roots registered later. The getter returns that default.
+
+With more than one root this is last-writer-wins across hosts, so it warns once. Use
+[`setRootFrameloop`](#setrootframelooprootid-mode) for per-root control, or
+`defaultFrameloop` to change only the default.
+
+### `defaultFrameloop` (getter/setter)
+
+The mode given to roots registered without an explicit `frameloop`. Unlike `frameloop`,
+setting it leaves existing roots alone.
+
+```ts
+scheduler.defaultFrameloop = 'demand'
+scheduler.registerRoot('later') // starts in demand
+```
 
 ### `invalidate(frames?, stackFrames?)`
 
@@ -415,6 +456,23 @@ scheduler.frameloop = 'never'
 scheduler.step() // run one frame
 scheduler.step(16.67) // run one frame at an explicit timestamp
 ```
+
+Note this runs **every** root, including `always` roots already being driven by the RAF. In
+a multi-root app, use `stepRoot` instead to avoid ticking those siblings twice.
+
+### `stepRoot(rootId, timestamp?)`
+
+Execute a single frame for one root, leaving its siblings untouched. This is the form to
+use when a host drives a `never` root from its own loop while other roots stay on the
+shared RAF driver:
+
+```ts
+scheduler.registerRoot('xr', { frameloop: 'never' })
+renderer.xr.setAnimationLoop((time) => scheduler.stepRoot('xr', time))
+```
+
+Like `step()`, it runs global before/after jobs and does **not** consume a pending demand
+frame. An unknown root warns and is otherwise ignored.
 
 ### `stepJob(id, timestamp?)`
 

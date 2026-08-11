@@ -1229,3 +1229,231 @@ describe('Ambient root & host adoption', () => {
     expect(order).toEqual(['ai', 'update'])
   })
 })
+
+//* Phase 1: Lifecycle Hardening ==============================
+// Driver ownership, targeted stepping, and root introspection.
+// @see docs/superpowers/plans/2026-08-11-lifecycle-followups.md
+
+describe('Scheduler lifecycle hardening', () => {
+  beforeEach(() => {
+    Scheduler.reset()
+  })
+
+  afterEach(() => {
+    Scheduler.reset()
+    vi.unstubAllGlobals()
+  })
+
+  //* Task 1: bulk setter ----------------------------------------
+
+  it('warns once when the bulk frameloop setter is used with multiple roots', () => {
+    createRafController()
+    const scheduler = Scheduler.get()
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+
+    scheduler.registerRoot('one')
+    scheduler.frameloop = 'demand'
+    expect(warn).not.toHaveBeenCalled()
+
+    scheduler.registerRoot('two')
+    scheduler.frameloop = 'always'
+    scheduler.frameloop = 'demand'
+
+    // Warn-once: r3f writes this on every render, so a per-call warn would flood.
+    expect(warn).toHaveBeenCalledTimes(1)
+    expect(warn.mock.calls[0][0]).toContain('setRootFrameloop')
+
+    warn.mockRestore()
+  })
+
+  it('sets the default for new roots without touching existing ones', () => {
+    createRafController()
+    const scheduler = Scheduler.get()
+
+    scheduler.registerRoot('existing', { frameloop: 'always' })
+    scheduler.defaultFrameloop = 'demand'
+
+    expect(scheduler.defaultFrameloop).toBe('demand')
+    expect(scheduler.getRootFrameloop('existing')).toBe('always')
+
+    scheduler.registerRoot('fresh')
+    expect(scheduler.getRootFrameloop('fresh')).toBe('demand')
+  })
+
+  //* Task 2: stepRoot -------------------------------------------
+
+  it('steps a single root without ticking its siblings', () => {
+    const raf = createRafController()
+    const scheduler = Scheduler.get()
+    const calls: string[] = []
+
+    scheduler.registerRoot('live', { frameloop: 'always' })
+    scheduler.registerRoot('manual', { frameloop: 'never' })
+    scheduler.register(() => calls.push('live'), { rootId: 'live' })
+    scheduler.register(() => calls.push('manual'), { rootId: 'manual' })
+
+    raf.flush(1000)
+    scheduler.stepRoot('manual', 1016)
+
+    // The r3f advance()/XR case: the always sibling must not tick twice.
+    expect(calls).toEqual(['live', 'manual'])
+  })
+
+  it('runs global jobs on stepRoot but leaves pending demand frames alone', () => {
+    const raf = createRafController()
+    const scheduler = Scheduler.get()
+    const calls: string[] = []
+
+    scheduler.registerRoot('demand', { frameloop: 'demand' })
+    scheduler.register(() => calls.push('job'), { rootId: 'demand' })
+    scheduler.registerGlobal('before', 'global', () => calls.push('global'))
+
+    scheduler.invalidateRoot('demand', 2)
+    scheduler.stepRoot('demand', 1000)
+
+    expect(calls).toEqual(['global', 'job'])
+
+    raf.flush(1016)
+    raf.flush(1032)
+
+    expect(calls.filter((c) => c === 'job')).toHaveLength(3)
+  })
+
+  it('warns and no-ops when stepping an unknown root', () => {
+    createRafController()
+    const scheduler = Scheduler.get()
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+
+    scheduler.stepRoot('missing')
+
+    expect(warn).toHaveBeenCalledTimes(1)
+    warn.mockRestore()
+  })
+
+  //* Task 3: sticky stop ----------------------------------------
+
+  it('stays stopped after stop() when roots mount or re-configure', () => {
+    const raf = createRafController()
+    const scheduler = Scheduler.get()
+
+    scheduler.registerRoot('always', { frameloop: 'always' })
+    scheduler.register(() => {}, { rootId: 'always' })
+    raf.flush(1000)
+
+    scheduler.stop()
+    expect(scheduler.isRunning).toBe(false)
+
+    scheduler.registerRoot('other') // a Canvas mounts
+    expect(scheduler.isRunning).toBe(false)
+
+    scheduler.frameloop = 'always' // an r3f re-configure
+    expect(scheduler.isRunning).toBe(false)
+
+    scheduler.setRootFrameloop('other', 'demand') // a mode change
+    expect(scheduler.isRunning).toBe(false)
+  })
+
+  it('resumes from stop() on explicit start or invalidation', () => {
+    createRafController()
+    const scheduler = Scheduler.get()
+
+    scheduler.registerRoot('demand', { frameloop: 'demand' })
+    scheduler.register(() => {}, { rootId: 'demand' })
+
+    scheduler.stop()
+    scheduler.invalidateRoot('demand')
+    expect(scheduler.isRunning).toBe(true)
+
+    scheduler.stop()
+    expect(scheduler.isRunning).toBe(false)
+
+    scheduler.start()
+    expect(scheduler.isRunning).toBe(true)
+  })
+
+  it('still steps manually while paused', () => {
+    createRafController()
+    const scheduler = Scheduler.get()
+    const calls: string[] = []
+
+    scheduler.registerRoot('root', { frameloop: 'always' })
+    scheduler.register(() => calls.push('root'), { rootId: 'root' })
+
+    scheduler.stop()
+    scheduler.step(1000)
+    scheduler.stepRoot('root', 1016)
+
+    expect(calls).toEqual(['root', 'root'])
+    expect(scheduler.isRunning).toBe(false)
+  })
+
+  it('does not latch paused when the last root unregisters', () => {
+    createRafController()
+    const scheduler = Scheduler.get()
+
+    const unregister = scheduler.registerRoot('only', { frameloop: 'always' })
+    scheduler.register(() => {}, { rootId: 'only' })
+    expect(scheduler.isRunning).toBe(true)
+
+    unregister()
+    expect(scheduler.isRunning).toBe(false)
+
+    // Teardown must not read as an explicit stop().
+    scheduler.registerRoot('next', { frameloop: 'always' })
+    expect(scheduler.isRunning).toBe(true)
+  })
+
+  //* Task 4: entering demand ------------------------------------
+
+  it('sleeps immediately on entering demand, however the root got there', () => {
+    const raf = createRafController()
+    const scheduler = Scheduler.get()
+    let switched = 0
+    let registered = 0
+
+    scheduler.registerRoot('switched', { frameloop: 'always' })
+    scheduler.register(() => switched++, { rootId: 'switched' })
+
+    raf.flush(1000)
+    expect(switched).toBe(1)
+
+    // Entering demand grants nothing — a demand root draws only when invalidated,
+    // and registering as demand must behave identically to switching to it.
+    scheduler.setRootFrameloop('switched', 'demand')
+    scheduler.registerRoot('registered', { frameloop: 'demand' })
+    scheduler.register(() => registered++, { rootId: 'registered' })
+
+    raf.flush(1016)
+    raf.flush(1032)
+
+    expect(switched).toBe(1)
+    expect(registered).toBe(0)
+    expect(scheduler.isRunning).toBe(false)
+  })
+
+  //* Task 5: introspection --------------------------------------
+
+  it('exposes root ids and modes', () => {
+    createRafController()
+    const scheduler = Scheduler.get()
+
+    scheduler.registerRoot('a', { frameloop: 'demand' })
+    scheduler.registerRoot('b')
+
+    expect(scheduler.getRootIds()).toEqual(['a', 'b'])
+    expect(scheduler.getRootFrameloop('a')).toBe('demand')
+    expect(scheduler.getRootFrameloop('missing')).toBeUndefined()
+  })
+
+  it('resolves a job root id across adoption', () => {
+    createRafController()
+    const scheduler = Scheduler.get()
+
+    scheduler.register(() => {}, { id: 'orphan' })
+    expect(scheduler.getJobRootId('orphan')).toBe(Scheduler.AMBIENT_ID)
+
+    scheduler.registerRoot('host')
+    expect(scheduler.getJobRootId('orphan')).toBe('host')
+    expect(scheduler.getJobRootId('nope')).toBeUndefined()
+  })
+})
