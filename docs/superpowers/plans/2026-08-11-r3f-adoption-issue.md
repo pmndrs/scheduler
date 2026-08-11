@@ -73,6 +73,6 @@ Requires `@pmndrs/scheduler@^0.2.0`.
 
 ## Not included
 
-Cross-root ordering. `renderer={{ scheduler: { after: 'main' } }}` currently attaches `after` to that root's _render job_, and job constraints are only resolved within a single root, so a cross-canvas reference is silently dropped — it appears to work only because the primary canvas usually registers first. Tracked separately upstream; it needs root-level ordering in the scheduler before r3f can pass it through.
+Cross-root ordering. `renderer={{ scheduler: { after: 'main' } }}` attaches `after` to that root's _render job_, and job constraints only resolve within a single root, so a cross-canvas reference is silently dropped — it appears to work only because the primary canvas usually registers first. `@pmndrs/scheduler@0.2.0` adds root-level `order` / `setRootOrder`, so r3f _can_ now migrate this, but it is a separate change with its own prop-shape decision and isn't required to fix the frameloop bug.
 
 Worth knowing for whoever picks that up: r3f uses `canvasId` as both the root id and the render job id (`renderer.tsx:637`, `renderer.tsx:742`), so `after: 'main'` reads identically whether it's interpreted as a root or a job reference. Migrating it to root level won't change anyone's config. The wrinkle is that `fps` lives in the same config bag and stays job-level, so that object would then span two levels of the scheduler API.

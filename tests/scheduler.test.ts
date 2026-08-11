@@ -1622,6 +1622,24 @@ describe('Scheduler per-root timing', () => {
     // Adoption changes the owning root, not the job's sense of time.
     expect(elapsed.at(-1)!).toBeCloseTo(beforeAdoption + 0.016, 5)
   })
+
+  it('keeps job deltas continuous across ambient adoption', () => {
+    const raf = createRafController()
+    const scheduler = Scheduler.get()
+    const deltas: number[] = []
+
+    scheduler.register((_state, delta) => deltas.push(delta), { id: 'orphan' })
+    raf.flush(1000)
+    raf.flush(1016)
+
+    scheduler.registerRoot('host', { frameloop: 'always' })
+    raf.flush(1032)
+
+    // A job's delta is measured against its root's accumulated clock, so adoption
+    // must carry that clock over — otherwise the first post-adoption delta is
+    // differenced against a reset root and comes out wrong.
+    expect(deltas.at(-1)).toBeCloseTo(0.016, 5)
+  })
 })
 
 //* Phase 3: Throttled Job Deltas ==============================

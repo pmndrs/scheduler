@@ -26,7 +26,7 @@
 | 4     | Cross-root ordering (Task 10)             | —            |
 | 5     | r3f adoption + issue filing (Tasks 11–12) | —            |
 
-Phases 1–3 ship together as `0.2.0`; r3f adopts against that. Phase 4 ships as `0.3.0`.
+Phases 1–4 all landed on `fix-for-multiview` and ship together as `0.2.0`; r3f adopts against that. (Phase 4 was originally slated for `0.3.0`, but it landed alongside Phase 3 rather than after a release.)
 
 ## Decisions Taken
 
@@ -308,7 +308,9 @@ Roots execute in Map registration order, and a job's `after` referencing a job i
 
 ### Task 11: react-three-fiber adoption
 
-Tracked in `2026-08-11-r3f-adoption-issue.md`, to be filed against `pmndrs/react-three-fiber`. Requires `@pmndrs/scheduler@^0.2.0`.
+Tracked in `2026-08-11-r3f-adoption-issue.md`, to be filed against `pmndrs/react-three-fiber`. Requires `@pmndrs/scheduler@^0.2.0` to be published first.
+
+Not started — this is work in the r3f repo, and the issue is yours to file.
 
 - [ ] Pass `frameloop` into `registerRoot` options (renderer.tsx:638)
 - [ ] `setRootFrameloop(rootId, frameloop)` instead of the global write (renderer.tsx:771)
@@ -340,9 +342,14 @@ Behavior changes for release notes:
 - Throttled jobs receive their real interval as `delta`, not the root delta. Anything compensating manually for the old half-speed behavior will now double-count.
 - The bulk `frameloop` setter warns with multiple roots.
 
-**`0.3.0`** — Phase 4. Additive (`RootOptions.order`, `setRootOrder`); execution order is unchanged for roots that set no order.
+Phase 4 is additive too (`RootOptions.order`, `setRootOrder`); execution order is unchanged for roots that set no order, so it folds into the same release.
 
-r3f bumps to `^0.2.0` in Task 11 and does not need `0.3.0`.
+Add to the behavior-change notes:
+
+- Throttled jobs receive their real interval as `delta`. Anything compensating manually for the old half-speed behavior will now double-count.
+- `getRootIds()` returns execution order rather than Map order (identical unless `order` is used).
+
+**Not yet done:** `package.json` still says `0.1.0`. Bump and tag when you're ready to publish; r3f's dependency bump in Task 11 needs the published version.
 
 ## Verification
 
