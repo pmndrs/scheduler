@@ -316,9 +316,12 @@ Roots execute in Map registration order, and a job's `after` referencing a job i
 
 ### Task 11: react-three-fiber adoption
 
-Tracked in `2026-08-11-r3f-adoption-issue.md`, to be filed against `pmndrs/react-three-fiber`. Requires `@pmndrs/scheduler@^0.2.0` to be published first.
+Tracked in [react-three-fiber#3852](https://github.com/pmndrs/react-three-fiber/issues/3852)
+and [PR #3865](https://github.com/pmndrs/react-three-fiber/pull/3865). The PR will
+replace its interim registry/gates with the root-scoped APIs after
+`@pmndrs/scheduler@^0.2.0` is published.
 
-Not started — this is work in the r3f repo, and the issue is yours to file.
+The downstream code remains pending in the r3f repository and targets v10 alpha 4.
 
 - [ ] Pass `frameloop` into `registerRoot` options (renderer.tsx:638)
 - [ ] `setRootFrameloop(rootId, frameloop)` instead of the global write (renderer.tsx:771)
@@ -329,10 +332,14 @@ Not started — this is work in the r3f repo, and the issue is yours to file.
 
 ### Task 12: Issue hygiene
 
-- [ ] File the r3f issue from `2026-08-11-r3f-adoption-issue.md`
-- [ ] Comment on [scheduler#1](https://github.com/pmndrs/scheduler/issues/1) stating precisely what the branch does and does not fix, and that the symptom persists until the r3f patch lands
-- [ ] Open a follow-up issue for r3f to route scheduler `before` / `after` to root constraints
-- [ ] Delete `2026-08-11-r3f-adoption-issue.md` once filed
+- [x] Update [r3f#3852](https://github.com/pmndrs/react-three-fiber/issues/3852)
+      and [PR #3865](https://github.com/pmndrs/react-three-fiber/pull/3865) with the
+      scheduler 0.2 migration path and alpha-4 target.
+- [x] Comment on [scheduler#1](https://github.com/pmndrs/scheduler/issues/1)
+      with the implemented scope, scheduler PR, and downstream status.
+- [x] Open [r3f#3877](https://github.com/pmndrs/react-three-fiber/issues/3877)
+      for root-level `before` / `after` adoption.
+- [x] Delete the superseded local r3f issue draft.
 
 ---
 
