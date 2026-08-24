@@ -11,7 +11,7 @@
 ## Global Constraints
 
 - Preserve the single application-wide `requestAnimationFrame` driver.
-- Every phase must leave `pnpm ci` green.
+- Every phase must leave `pnpm run ci` green.
 - Additive API wherever possible; behavior changes go in release notes (see [Release sequencing](#release-sequencing)).
 - Root-major execution (each root runs all its phases before the next root) stays the contract. Phase-major execution across roots is explicitly out of scope.
 - Do not create a git commit unless the user explicitly requests one.
@@ -352,4 +352,4 @@ Behavior changes for release notes:
 
 ## Verification
 
-Run `pnpm ci` after every task. Each task's tests must fail before its implementation and pass after.
+Run `pnpm run ci` after every task. Each task's tests must fail before its implementation and pass after.
