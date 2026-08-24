@@ -1817,6 +1817,23 @@ describe('Scheduler root ordering', () => {
     expect(scheduler.getRootIds()).toEqual(['main', 'overlay'])
   })
 
+  it('runs a root after its dependency regardless of registration sequence', () => {
+    const raf = createRafController()
+    const scheduler = Scheduler.get()
+    const calls: string[] = []
+
+    // The dependent root mounts first, as can happen through Suspense.
+    scheduler.registerRoot('overlay', { after: 'main' })
+    scheduler.registerRoot('main')
+    scheduler.register(() => calls.push('overlay'), { rootId: 'overlay' })
+    scheduler.register(() => calls.push('main'), { rootId: 'main' })
+
+    raf.flush(1000)
+
+    expect(calls).toEqual(['main', 'overlay'])
+    expect(scheduler.getRootIds()).toEqual(['main', 'overlay'])
+  })
+
   it('falls back to registration order for equal orders', () => {
     const raf = createRafController()
     const scheduler = Scheduler.get()
@@ -1832,6 +1849,186 @@ describe('Scheduler root ordering', () => {
     raf.flush(1000)
 
     expect(calls).toEqual(['first', 'second', 'third'])
+  })
+
+  it('supports dependency chains that override numeric order', () => {
+    createRafController()
+    const scheduler = Scheduler.get()
+
+    scheduler.registerRoot('finish', { order: -100, after: 'middle' })
+    scheduler.registerRoot('middle', { after: 'start' })
+    scheduler.registerRoot('start', { order: 100 })
+
+    expect(scheduler.getRootIds()).toEqual(['start', 'middle', 'finish'])
+  })
+
+  it('deduplicates equivalent before and after constraints', () => {
+    createRafController()
+    const scheduler = Scheduler.get()
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+
+    scheduler.registerRoot('second', { after: 'first' })
+    scheduler.registerRoot('first', { before: 'second' })
+
+    expect(scheduler.getRootIds()).toEqual(['first', 'second'])
+    expect(warn).not.toHaveBeenCalled()
+
+    warn.mockRestore()
+  })
+
+  it('resolves dormant constraints when a referenced root registers later', () => {
+    createRafController()
+    const scheduler = Scheduler.get()
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+
+    const unregisterOverlay = scheduler.registerRoot('overlay', { after: 'main' })
+    expect(scheduler.getRootIds()).toEqual(['overlay'])
+
+    const unregisterMain = scheduler.registerRoot('main')
+    expect(scheduler.getRootIds()).toEqual(['main', 'overlay'])
+
+    unregisterMain()
+    expect(scheduler.getRootIds()).toEqual(['overlay'])
+
+    scheduler.registerRoot('main')
+    expect(scheduler.getRootIds()).toEqual(['main', 'overlay'])
+    expect(warn).not.toHaveBeenCalled()
+
+    unregisterOverlay()
+    warn.mockRestore()
+  })
+
+  it('replaces and clears constraints at runtime', () => {
+    createRafController()
+    const scheduler = Scheduler.get()
+
+    scheduler.registerRoot('middle')
+    scheduler.registerRoot('first')
+    scheduler.registerRoot('last')
+    expect(scheduler.getRootIds()).toEqual(['middle', 'first', 'last'])
+
+    scheduler.setRootConstraints('middle', { after: 'first', before: 'last' })
+    expect(scheduler.getRootIds()).toEqual(['first', 'middle', 'last'])
+
+    scheduler.setRootConstraints('middle', { after: 'last', before: 'first' })
+    expect(scheduler.getRootIds()).toEqual(['last', 'middle', 'first'])
+
+    scheduler.setRootConstraints('middle', {})
+    expect(scheduler.getRootIds()).toEqual(['middle', 'first', 'last'])
+  })
+
+  it('does not rebuild equivalent normalized constraints', () => {
+    createRafController()
+    const scheduler = Scheduler.get()
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+
+    scheduler.registerRoot('first', {
+      before: ['second', 'third'],
+      after: ['second', 'third'],
+    })
+    scheduler.registerRoot('second')
+    scheduler.registerRoot('third')
+
+    scheduler.getRootIds()
+    expect(warn).toHaveBeenCalledTimes(1)
+    warn.mockClear()
+
+    scheduler.setRootConstraints('first', {
+      before: ['third', 'second', 'second'],
+      after: ['third', 'second', 'third'],
+    })
+    scheduler.getRootIds()
+    scheduler.setRootConstraints('first', {
+      before: ['second', 'third'],
+      after: ['second', 'third'],
+    })
+    scheduler.getRootIds()
+
+    expect(warn).not.toHaveBeenCalled()
+
+    warn.mockRestore()
+  })
+
+  it('applies constraint changes made during a frame on the next frame', () => {
+    const raf = createRafController()
+    const scheduler = Scheduler.get()
+    const calls: string[] = []
+    let changed = false
+
+    scheduler.registerRoot('first')
+    scheduler.registerRoot('second')
+    scheduler.register(
+      () => {
+        calls.push('first')
+        if (!changed) {
+          changed = true
+          scheduler.setRootConstraints('first', { after: 'second' })
+        }
+      },
+      { rootId: 'first' },
+    )
+    scheduler.register(() => calls.push('second'), { rootId: 'second' })
+
+    raf.flush(1000)
+    expect(calls).toEqual(['first', 'second'])
+
+    raf.flush(1016)
+    expect(calls).toEqual(['first', 'second', 'second', 'first'])
+  })
+
+  it('orders only roots selected for the current frame', () => {
+    const raf = createRafController()
+    const scheduler = Scheduler.get()
+    const calls: string[] = []
+
+    scheduler.registerRoot('overlay', { after: 'main' })
+    scheduler.registerRoot('main', { frameloop: 'demand' })
+    scheduler.register(() => calls.push('overlay'), { rootId: 'overlay' })
+    scheduler.register(() => calls.push('main'), { rootId: 'main' })
+
+    raf.flush(1000)
+    expect(calls).toEqual(['overlay'])
+
+    scheduler.invalidateRoot('main')
+    raf.flush(1016)
+    expect(calls).toEqual(['overlay', 'main', 'overlay'])
+  })
+
+  it('warns on dependency cycles and runs every root deterministically', () => {
+    const raf = createRafController()
+    const scheduler = Scheduler.get()
+    const calls: string[] = []
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+
+    scheduler.registerRoot('first', { after: 'second' })
+    scheduler.registerRoot('second', { after: 'first' })
+    scheduler.register(() => calls.push('first'), { rootId: 'first' })
+    scheduler.register(() => calls.push('second'), { rootId: 'second' })
+
+    raf.flush(1000)
+
+    expect(calls).toEqual(['first', 'second'])
+    expect(warn).toHaveBeenCalledWith('[Scheduler] Circular dependency detected in root constraints')
+
+    warn.mockRestore()
+  })
+
+  it('preserves valid edges entering and leaving a dependency cycle', () => {
+    createRafController()
+    const scheduler = Scheduler.get()
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+
+    // Numeric preference puts downstream first, but its edge from second remains
+    // valid even though first and second must fall back within their cycle.
+    scheduler.registerRoot('downstream', { order: -10, after: 'second' })
+    scheduler.registerRoot('first', { after: 'second' })
+    scheduler.registerRoot('second', { after: 'first' })
+    scheduler.registerRoot('upstream', { order: 10, before: 'first' })
+
+    expect(scheduler.getRootIds()).toEqual(['upstream', 'first', 'second', 'downstream'])
+    expect(warn).toHaveBeenCalledWith('[Scheduler] Circular dependency detected in root constraints')
+
+    warn.mockRestore()
   })
 
   it('reorders at runtime without disturbing sleeping roots', () => {
@@ -1898,8 +2095,9 @@ describe('Scheduler root ordering', () => {
     const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
 
     scheduler.setRootOrder('missing', 3)
+    scheduler.setRootConstraints('missing', { after: 'also-missing' })
 
-    expect(warn).toHaveBeenCalledTimes(1)
+    expect(warn).toHaveBeenCalledTimes(2)
     warn.mockRestore()
   })
 })

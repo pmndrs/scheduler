@@ -26,7 +26,7 @@
 | 4     | Cross-root ordering (Task 10)             | —            |
 | 5     | r3f adoption + issue filing (Tasks 11–12) | —            |
 
-Phases 1–4 all landed on `fix-for-multiview` and ship together as `0.2.0`; r3f adopts against that. (Phase 4 was originally slated for `0.3.0`, but it landed alongside Phase 3 rather than after a release.)
+Phases 1–4 all landed on `fix-for-multiview` and ship together as `0.2.0`; r3f adopts against that. Phase 4 includes both numeric and dependency-based root ordering — root constraints are not deferred.
 
 ## Decisions Taken
 
@@ -35,7 +35,7 @@ Recorded here so implementers don't re-litigate them mid-task.
 1. **The bulk `frameloop` setter keeps its fan-out.** Tracking "which roots were explicitly set" replaces last-writer-wins with a subtler rule that is harder to explain. Instead it warns once when used with multiple roots, and `defaultFrameloop` becomes the honest name for the default-only behavior. Deprecating the setter waits until r3f is patched.
 2. **Waking demand roots do not fast-forward.** A canvas that idles while off-screen and jumps on return is worse than one that resumes where it left off. The freeze policy is kept — but made deterministic and configurable via `maxDelta` rather than emerging from whether an unrelated sibling happens to be running.
 3. **`stop()` becomes sticky, but explicit frame requests clear it.** `invalidate()`, `invalidateRoot()`, and `start()` clear the paused flag; root registration, mode changes, and the bulk setter do not. This matches pre-branch semantics, where only `invalidate` in demand mode could restart a stopped loop. _Alternative considered:_ paused blocks everything until `start()`. Rejected because it makes `invalidate()` a silent no-op after a `stop()`, which is its own debugging trap.
-4. **Cross-root ordering starts as a numeric `order`, not a dependency graph.** Every hard semantic in the graph design (cycles, unresolved references, late registration, runtime updates) exists only because of the graph. An integer sorts async-mounted roots into place with no cycles possible. The graph is a later refinement if a concrete case demands it.
+4. **Cross-root ordering started as numeric `order`, then gained dependencies once the concrete r3f case required them.** Numeric order remains the stable fallback. Root-level `before` / `after` now preserve the existing `scheduler: { after: 'main' }` intent without relying on mount order; missing references stay dormant, runtime updates replace both constraint sets, and cycles warn before falling back deterministically.
 
 ---
 
@@ -282,6 +282,7 @@ Roots execute in Map registration order, and a job's `after` referencing a job i
 
 **Files:**
 
+- Create: `src/core/rootSorter.ts`
 - Modify: `src/core/scheduler.ts`, `src/types.ts`
 - Modify: `docs/scheduler.md`, `docs/concepts.md`
 - Test: `tests/scheduler.test.ts`
@@ -289,7 +290,9 @@ Roots execute in Map registration order, and a job's `after` referencing a job i
 **Interfaces:**
 
 - Produces: `RootOptions.order?: number` (default `0`)
+- Produces: `RootOptions.before?` / `RootOptions.after?`
 - Produces: `SchedulerApi.setRootOrder(rootId: string, order: number): void`
+- Produces: `SchedulerApi.setRootConstraints(rootId, constraints): void`
 
 - [x] **Step 1:** `order` on `RootOptions` / `RootEntry`, default `0`, ties broken by a new `sequence` field (a dedicated counter — `nextRootIndex` belongs to `generateRootId` and only increments when that is called, so it would have produced gaps and mis-ordered explicitly-named roots).
 - [x] **Step 2:** Cached `sortedRoots` + `rootsNeedSort`, rebuilt lazily on register, unregister, or order change.
@@ -297,10 +300,12 @@ Roots execute in Map registration order, and a job's `after` referencing a job i
 - [x] **Step 4:** `setRootOrder(rootId, order)`; warns and no-ops on unknown roots.
 - [x] **Step 5:** Documented in `docs/scheduler.md` and `docs/concepts.md`.
 - [x] **Step 6:** Tests — reversed registration, equal-order fallback, runtime reorder with a sleeping root in between, ordering preserved after an unregister, and `step()` following the same order.
+- [x] **Step 7:** Added stable Kahn sorting for root-level `before` / `after`. Numeric order and registration sequence prioritize the ready queue; missing targets stay dormant for late registration; duplicate edges are deduplicated; cycles warn and append unresolved roots in deterministic fallback order.
+- [x] **Step 8:** Added runtime constraint replacement plus coverage for chains, late registration, target removal/re-registration, sleeping roots, in-frame updates, and cycles.
 
 > **Also changed:** `getRootIds()` now returns execution order rather than Map order. With no explicit ordering the two are identical, so nothing observable changes for existing callers, and "the order they run in" is the more useful answer when debugging why one canvas drew first.
 
-**Deferred:** root-level `before`/`after` constraints. If a concrete case needs them, extract the Kahn implementation in `sorter.ts:100` to a generic over `{ id, before, after, index }` and reuse it — including its cycle fallback (warn once, append unresolved members in registration order). Unlike jobs, an unresolved _root_ reference should **persist** rather than be dropped at sort time, because async mounting makes late arrival normal.
+**Measured rebuild cost:** No-constraint sorting remains effectively equal to the original numeric sorter (about `0.002ms` for 16 roots). A 16-root dependency chain averaged `0.010ms`; even a synthetic 1,000-root chain averaged `1.08ms`. The result is cached, so none of this work occurs per frame.
 
 ---
 
@@ -323,31 +328,25 @@ Not started — this is work in the r3f repo, and the issue is yours to file.
 
 - [ ] File the r3f issue from `2026-08-11-r3f-adoption-issue.md`
 - [ ] Comment on [scheduler#1](https://github.com/pmndrs/scheduler/issues/1) stating precisely what the branch does and does not fix, and that the symptom persists until the r3f patch lands
-- [ ] Open follow-up issues for Phase 4 and for the deferred root-level `before`/`after`
+- [ ] Open a follow-up issue for r3f to route scheduler `before` / `after` to root constraints
 - [ ] Delete `2026-08-11-r3f-adoption-issue.md` once filed
 
 ---
 
 ## Release sequencing
 
-**`0.2.0`** — Phases 1–3.
+**`0.2.0`** — Phases 1–4, including numeric and dependency-based root ordering.
 
-Additive: `stepRoot`, `getRootFrameloop`, `getRootIds`, `defaultFrameloop`, `RootOptions.maxDelta`, `FrameControls.rootId` / `.invalidate`.
+Additive: `stepRoot`, `getRootFrameloop`, `getRootIds`, `defaultFrameloop`, `RootOptions.maxDelta` / `.order` / `.before` / `.after`, `setRootOrder`, `setRootConstraints`, and `FrameControls.rootId` / `.invalidate`.
 
 Behavior changes for release notes:
 
 - `stop()` is sticky; only `start()` and explicit invalidation resume the driver.
-- Entering `demand` grants one frame.
+- Entering `demand` grants no frame; a demand root draws only when explicitly invalidated.
 - `elapsed` is per-root accumulated time, not driver wall-clock. Visible to demand roots only.
 - Throttled jobs receive their real interval as `delta`, not the root delta. Anything compensating manually for the old half-speed behavior will now double-count.
 - The bulk `frameloop` setter warns with multiple roots.
-
-Phase 4 is additive too (`RootOptions.order`, `setRootOrder`); execution order is unchanged for roots that set no order, so it folds into the same release.
-
-Add to the behavior-change notes:
-
-- Throttled jobs receive their real interval as `delta`. Anything compensating manually for the old half-speed behavior will now double-count.
-- `getRootIds()` returns execution order rather than Map order (identical unless `order` is used).
+- `getRootIds()` returns execution order rather than Map order (identical unless root ordering is configured).
 
 **Not yet done:** `package.json` still says `0.1.0`. Bump and tag when you're ready to publish; r3f's dependency bump in Task 11 needs the published version.
 

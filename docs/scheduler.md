@@ -159,7 +159,9 @@ interface RootOptions {
   getState?: () => any // state provider merged into the frame state
   onError?: (error: Error) => void // job error handler (default: console.error)
   frameloop?: 'always' | 'demand' | 'never' // defaults to scheduler.frameloop
-  order?: number // execution order; lower runs first (default: 0)
+  order?: number // preferred order; lower runs first (default: 0)
+  before?: string | string[] // hard dependency on other root ids
+  after?: string | string[] // hard dependency on other root ids
   maxDelta?: number // delta cap in seconds; defaults to one driver frame
 }
 ```
@@ -193,24 +195,44 @@ Change one root's lifecycle mode without affecting its siblings:
 scheduler.setRootFrameloop('my-root', 'demand')
 ```
 
-Leaving demand mode clears that root's pending frame count. An unknown root warns and is
-otherwise ignored.
+Entering `demand` grants no frame; call `invalidateRoot('my-root')` when that root should
+run. Leaving demand mode clears that root's pending frame count. An unknown root warns
+and is otherwise ignored.
 
 ### `setRootOrder(rootId, order)`
 
-Set one root's execution order. Lower runs first; equal values keep registration order.
+Set one root's preferred execution order. Lower runs first when no hard dependency decides
+the result; equal values keep registration order.
 
 ```ts
 scheduler.setRootOrder('overlay', 10) // draws after the default-0 roots
 ```
 
+### `setRootConstraints(rootId, constraints)`
+
+Replace one root's hard ordering dependencies:
+
+```ts
+scheduler.registerRoot('overlay', { after: 'main' })
+scheduler.setRootConstraints('overlay', { after: ['main', 'background'] })
+scheduler.setRootConstraints('overlay', {}) // clear both sets
+```
+
+`before` and `after` reference root ids, not job ids. Constraints override numeric `order`;
+numeric order and registration sequence remain the stable preference whenever several
+roots are otherwise available.
+
+References to roots that have not registered yet stay dormant and resolve automatically
+if they appear later. Circular dependencies warn and fall back to deterministic numeric /
+registration order for the affected roots, so every root still executes once.
+
 Registration order alone isn't stable — Suspense, conditional rendering, and remounts can
-reverse it — so roots that share a renderer and must draw in a fixed sequence should say
-so explicitly rather than relying on mount timing.
+reverse it — so roots that share a renderer and must draw in a fixed sequence should use
+root constraints rather than relying on mount timing.
 
 Ordering applies only to roots selected for that frame: a sleeping `demand` root ordered
 between two others is skipped, not woken to hold its place. Sorting happens when roots are
-added, removed, or reordered — never per frame.
+added, removed, reordered, or given new constraints — never per frame.
 
 > Ordering reorders **whole roots**. Execution is root-major (each root runs all of its
 > phases before the next root starts), so "every canvas's physics, then every canvas's
@@ -232,7 +254,8 @@ Number of registered roots.
 
 ### `getRootIds(): string[]`
 
-All registered root ids, in registration order.
+All registered root ids, in execution order. Without explicit root ordering this matches
+registration order.
 
 ### `getRootFrameloop(rootId): Frameloop | undefined`
 

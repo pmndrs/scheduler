@@ -6,7 +6,8 @@ Implement the lifecycle portion of [issue #1](https://github.com/pmndrs/schedule
 keep one application-wide RAF driver while allowing each root to choose its own wake and
 execution policy.
 
-Cross-root ordering is intentionally deferred to a separate change.
+This document intentionally covers lifecycle only. Cross-root ordering was implemented
+as the subsequent Phase 4 and ships alongside this work in `0.2.0`.
 
 ## Problem
 

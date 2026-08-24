@@ -98,6 +98,10 @@ export interface RootOptions {
    * or remounts.
    */
   order?: number
+  /** Run this root before the referenced root id(s). */
+  before?: string | string[]
+  /** Run this root after the referenced root id(s). */
+  after?: string | string[]
   /**
    * Largest delta (in seconds) this root's callbacks can receive, capping how far
    * it catches up after skipping frames.
@@ -186,6 +190,7 @@ export interface SchedulerApi {
   defaultFrameloop: Frameloop
   setRootFrameloop(rootId: string, mode: Frameloop): void
   setRootOrder(rootId: string, order: number): void
+  setRootConstraints(rootId: string, constraints: Pick<RootOptions, 'before' | 'after'>): void
 
   //* Manual Stepping
   step(timestamp?: number): void
@@ -310,6 +315,10 @@ export interface RootEntry {
   order: number
   /** Registration sequence, for stable ordering between equal `order` values */
   sequence: number
+  /** Root ids this root must execute before */
+  before: Set<string>
+  /** Root ids this root must execute after */
+  after: Set<string>
   /** Timestamp of this root's last tick in ms (null = never ticked) */
   lastTickTime: number | null
   /** Sum of the deltas this root has received, in seconds */

@@ -20,6 +20,7 @@ import type {
 } from '../types'
 import { PhaseGraph } from './phaseGraph'
 import { rebuildSortedJobs } from './sorter'
+import { rebuildSortedRoots } from './rootSorter'
 import { shouldRun, resetJobTiming } from './rateLimiter'
 
 //* HMR Support ==============================
@@ -236,6 +237,8 @@ export class Scheduler {
       pendingFrames: 0,
       order: options.order ?? 0,
       sequence: this.nextRootSequence++,
+      before: this.normalizeConstraints(options.before),
+      after: this.normalizeConstraints(options.after),
       lastTickTime: null,
       accumulatedTime: 0,
       maxDelta: options.maxDelta,
@@ -784,7 +787,8 @@ export class Scheduler {
   }
 
   /**
-   * Set one root's execution order. Lower runs first; ties keep registration order.
+   * Set one root's preferred execution order. Lower runs first among roots whose
+   * hard before/after constraints allow either to run.
    *
    * Registration order alone isn't stable — Suspense, conditional rendering, and
    * remounts can reverse it — so roots that share a renderer and must draw in a
@@ -806,16 +810,37 @@ export class Scheduler {
   }
 
   /**
-   * Roots in execution order, sorted lazily and cached until the set of roots or
-   * their order changes — never per frame.
+   * Replace one root's hard ordering constraints.
+   * Missing target ids remain dormant and resolve if that root registers later.
+   * @param {string} rootId - Root to update
+   * @param {Pick<RootOptions, 'before' | 'after'>} constraints - New constraints
+   * @returns {void}
+   */
+  setRootConstraints(rootId: string, constraints: Pick<RootOptions, 'before' | 'after'>): void {
+    const root = this.roots.get(rootId)
+    if (!root) {
+      console.warn(`[Scheduler] Root "${rootId}" not found; constraints not updated.`)
+      return
+    }
+
+    const before = this.normalizeConstraints(constraints.before)
+    const after = this.normalizeConstraints(constraints.after)
+    if (this.constraintSetsEqual(root.before, before) && this.constraintSetsEqual(root.after, after)) return
+
+    root.before = before
+    root.after = after
+    this.rootsNeedSort = true
+  }
+
+  /**
+   * Roots in execution order, sorted lazily and cached until roots or their
+   * ordering constraints change — never per frame.
    * @returns {RootEntry[]} Roots in the order they should run
    * @private
    */
   private getExecutionRoots(): RootEntry[] {
     if (this.rootsNeedSort) {
-      this.sortedRoots = Array.from(this.roots.values()).sort((a, b) =>
-        a.order !== b.order ? a.order - b.order : a.sequence - b.sequence,
-      )
+      this.sortedRoots = rebuildSortedRoots(this.roots.values())
       this.rootsNeedSort = false
     }
     return this.sortedRoots
@@ -1193,7 +1218,7 @@ export class Scheduler {
 
   /**
    * Snapshot roots eligible for the next automatic frame and consume demand tokens.
-   * @returns {RootEntry[]} Roots that should execute in registration order
+   * @returns {RootEntry[]} Roots that should execute in resolved root order
    * @private
    */
   private collectAutomaticRoots(): RootEntry[] {
@@ -1272,8 +1297,8 @@ export class Scheduler {
   }
 
   /**
-   * Get all registered root IDs in execution order (see {@link Scheduler.setRootOrder}).
-   * With no explicit ordering this is registration order.
+   * Get all registered root IDs in execution order.
+   * With no explicit order or constraints this is registration order.
    * @returns {string[]} Array of root IDs
    */
   getRootIds(): string[] {
@@ -1404,6 +1429,15 @@ export class Scheduler {
     if (!value) return new Set()
     if (Array.isArray(value)) return new Set(value)
     return new Set([value])
+  }
+
+  /** Compare normalized constraint sets without depending on insertion order. */
+  private constraintSetsEqual(left: Set<string>, right: Set<string>): boolean {
+    if (left.size !== right.size) return false
+    for (const value of left) {
+      if (!right.has(value)) return false
+    }
+    return true
   }
 }
 

@@ -200,7 +200,7 @@ explicit `phase` the scheduler resolves it in that order:
 
 Tier 3 matters if you reference a job that hasn't registered yet, or one in a **different
 root**: job dependencies only resolve within a single root. Order whole roots with
-[`order`](./scheduler.md#setrootorderrootid-order) instead.
+[root constraints](./scheduler.md#setrootconstraintsrootid-constraints) instead.
 
 ## FPS throttling and frame budget management
 
@@ -244,6 +244,28 @@ scheduler.register((state, delta) => (y += delta * 100), { fps: 30 })
 
 The delta is measured against the owning root's clock, so it also excludes any time the
 root spent asleep — a throttled job in a demand canvas can't jump on wake either.
+
+## Root ordering
+
+Roots execute as complete units: one root runs all of its phases before the next root
+starts. When canvases share a renderer, make that order explicit instead of relying on
+which React tree mounts first:
+
+```ts
+scheduler.registerRoot('overlay', { after: 'main' })
+scheduler.registerRoot('main')
+```
+
+`before` and `after` reference root ids and are hard dependencies. The optional numeric
+`order` prioritizes roots that are currently free to run:
+
+```ts
+scheduler.registerRoot('background', { order: -10 })
+scheduler.registerRoot('main', { after: 'background' })
+```
+
+The dependency graph is rebuilt only when roots or their constraints change, then cached
+for frame execution. A sleeping root is filtered from that order without being woken.
 
 ## Frameloop modes
 
