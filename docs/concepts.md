@@ -191,6 +191,17 @@ scheduler.register(updateCharacter, { after: ['physics', 'input'] })
 scheduler.register(earlySetup, { before: ['physics', 'update'] })
 ```
 
+A `before`/`after` target can name either a phase or a job, and when you don't pass an
+explicit `phase` the scheduler resolves it in that order:
+
+1. **A phase** — it generates the ordering slot around it (`before:render`).
+2. **A job id** — the job joins that job's phase, and the two are ordered within it.
+3. **Neither** — it warns and falls back to `update`.
+
+Tier 3 matters if you reference a job that hasn't registered yet, or one in a **different
+root**: job dependencies only resolve within a single root. Order whole roots with
+[root constraints](./scheduler.md#setrootconstraintsrootid-constraints) instead.
+
 ## FPS throttling and frame budget management
 
 Not all work needs 60fps. Expensive operations can run slower without hurting perceived
@@ -219,36 +230,118 @@ When a throttled job misses its window, you choose how it recovers:
 On high-refresh displays (120Hz, 144Hz) your every-frame work runs faster while throttled
 jobs stay capped.
 
-## Frameloop modes
+### Throttled jobs get their own delta
 
-Control how the loop runs via `scheduler.frameloop`:
+A throttled job receives the time since **its** last run, not since the last frame. An
+`fps: 30` job in a 60fps loop is handed ~33ms, so `x += delta * speed` moves at the same
+speed whether or not you throttle it:
 
 ```ts
-scheduler.frameloop = 'always' // continuous RAF (default)
-scheduler.frameloop = 'demand' // only render when invalidate() is called
-scheduler.frameloop = 'never' //  manual — advance with step()
+// Both cross the screen at the same rate; one just updates half as often.
+scheduler.register((state, delta) => (x += delta * 100))
+scheduler.register((state, delta) => (y += delta * 100), { fps: 30 })
 ```
 
-- **`always`** — jobs run every animation frame.
-- **`demand`** — the loop sleeps until `scheduler.invalidate()` requests frames. Great for
-  static scenes that change occasionally.
-- **`never`** — nothing runs until you call `scheduler.step()`. Great for tests and
-  non-realtime rendering.
+The delta is measured against the owning root's clock, so it also excludes any time the
+root spent asleep — a throttled job in a demand canvas can't jump on wake either.
+
+## Root ordering
+
+Roots execute as complete units: one root runs all of its phases before the next root
+starts. When canvases share a renderer, make that order explicit instead of relying on
+which React tree mounts first:
 
 ```ts
-// demand
+scheduler.registerRoot('overlay', { after: 'main' })
+scheduler.registerRoot('main')
+```
+
+`before` and `after` reference root ids and are hard dependencies. The optional numeric
+`order` prioritizes roots that are currently free to run:
+
+```ts
+scheduler.registerRoot('background', { order: -10 })
+scheduler.registerRoot('main', { after: 'background' })
+```
+
+The dependency graph is rebuilt only when roots or their constraints change, then cached
+for frame execution. A sleeping root is filtered from that order without being woken.
+
+## Frameloop modes
+
+The scheduler owns one RAF driver, while each root owns its wake policy:
+
+- **`always`** — that root runs every animation frame.
+- **`demand`** — that root sleeps until it is invalidated.
+- **`never`** — that root runs only during an explicit manual step.
+
+```ts
+scheduler.registerRoot('hero', { frameloop: 'demand' })
+scheduler.registerRoot('game', { frameloop: 'always' })
+
+scheduler.invalidateRoot('hero') // wakes only the hero
+```
+
+The RAF remains active while any root is `always` or any demand root has pending frames.
+Sleeping roots are skipped entirely, including their state provider and jobs.
+
+For single-root and legacy usage, `scheduler.frameloop` remains a bulk control. Its setter
+updates every existing root and becomes the default for roots registered later:
+
+```ts
 scheduler.frameloop = 'demand'
 button.addEventListener('click', () => {
   updateSomething()
-  scheduler.invalidate() // request one frame
+  scheduler.invalidate() // wakes every demand root
 })
 
-// never
 scheduler.frameloop = 'never'
-scheduler.step() // advance exactly one frame
+scheduler.step() // manually advances every root once
 ```
 
-> In react-three-fiber the `<Canvas frameloop="...">` prop sets this for you.
+`start()` and `stop()` are low-level overrides. An explicit `start()` runs every root
+continuously until `stop()` is called, and `stop()` holds the driver stopped — root
+registration and mode changes won't restart it, only `start()` or an invalidation.
+
+## Timing
+
+`time` and `frame` come from the driver: every root running on the same animation frame
+sees the same values.
+
+`delta` and `elapsed` belong to the **root**. A root that sleeps doesn't accumulate time it
+never saw, so `elapsed` is always the sum of the deltas that root actually received — not
+how long the app has been running. A canvas that mounts ten seconds in starts at zero.
+
+For a root that runs every frame — the common case — `delta` is exactly the driver's frame
+delta, unchanged. The difference only shows up when a root skips frames:
+
+```ts
+// Off-screen for 8 seconds, then invalidated.
+scheduler.invalidateRoot('hero')
+// delta is ~0.016, not 8. The animation resumes; it doesn't jump forward.
+```
+
+That cap defaults to one driver frame, which self-tunes across refresh rates. The scheduler
+retains the last positive interval when the RAF stops, so the first wake frame after a
+restart uses the same cap instead of collapsing to zero. Raise it per root to allow bounded
+catch-up, or opt into true wall-clock deltas:
+
+```ts
+scheduler.registerRoot('sim', { frameloop: 'demand', maxDelta: 0.1 }) // catch up, bounded
+scheduler.registerRoot('clock', { frameloop: 'demand', maxDelta: Infinity }) // wall clock
+```
+
+Pick `Infinity` when a root models real elapsed time (a simulation that must stay in sync
+with the wall clock) and the default when it drives animation, where a jump reads as a
+glitch.
+
+> `frame` counts driver frames and resets whenever the RAF restarts, so it is a frame
+> _marker_, not a stable per-root counter. In demand-heavy apps that start and stop the
+> driver often, don't derive state from it.
+>
+> `stepRoot()` is a targeted external-driver tick: it advances only that root's timing and
+> leaves the shared driver's `time`, `frame`, and elapsed clock untouched. Global `step()`
+> remains a full shared frame.
 
 ## A real game loop
 

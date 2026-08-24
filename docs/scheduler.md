@@ -15,7 +15,8 @@ directly from any JavaScript app.
 - Per-job FPS throttling with drop/catch-up semantics
 - Pause/resume individual jobs
 - Manual stepping for testing and `frameloop='never'`
-- Demand mode via `invalidate()`
+- Per-root `always`, `demand`, and `never` lifecycle modes
+- Root-scoped and fan-out invalidation
 
 ## Architecture
 
@@ -150,13 +151,18 @@ explicitly for multi-root setups).
 
 ### `registerRoot(id, options?)`
 
-Register a root. The first root to register starts the loop (when `frameloop='always'`).
-Returns an unsubscribe function.
+Register a root. An `always` root starts the shared RAF driver; demand and never roots stay
+idle until explicitly requested. Returns an unsubscribe function.
 
 ```ts
 interface RootOptions {
   getState?: () => any // state provider merged into the frame state
   onError?: (error: Error) => void // job error handler (default: console.error)
+  frameloop?: 'always' | 'demand' | 'never' // defaults to scheduler.frameloop
+  order?: number // preferred order; lower runs first (default: 0)
+  before?: string | string[] // hard dependency on other root ids
+  after?: string | string[] // hard dependency on other root ids
+  maxDelta?: number // delta cap in seconds; defaults to one driver frame
 }
 ```
 
@@ -165,6 +171,7 @@ interface RootOptions {
 const unsubscribe = scheduler.registerRoot('my-root', {
   getState: () => store.getState(),
   onError: (err) => reportError(err),
+  frameloop: 'demand',
 })
 
 // Minimal — timing-only state
@@ -173,7 +180,64 @@ scheduler.registerRoot('standalone')
 
 - `getState` is how a host injects its own state (r3f injects its `RootState`). Whatever it
   returns is spread into the object passed to every job callback, alongside timing.
+- Roots share one RAF driver and its `time` / `frame`, but their mode, pending demand
+  frames, `delta`, and `elapsed` are independent — a sleeping root doesn't accumulate time
+  it never saw. `maxDelta` caps how far a root catches up after skipping frames; the default
+  uses the current driver interval, or the last measured positive interval after a restart,
+  so a waking root resumes rather than jumping or receiving zero. See
+  [Timing](./concepts.md#timing).
 - The last root to unregister stops the loop.
+
+### `setRootFrameloop(rootId, mode)`
+
+Change one root's lifecycle mode without affecting its siblings:
+
+```ts
+scheduler.setRootFrameloop('my-root', 'demand')
+```
+
+Entering `demand` grants no frame; call `invalidateRoot('my-root')` when that root should
+run. Leaving demand mode clears that root's pending frame count. An unknown root warns
+and is otherwise ignored.
+
+### `setRootOrder(rootId, order)`
+
+Set one root's preferred execution order. Lower runs first when no hard dependency decides
+the result; equal values keep registration order.
+
+```ts
+scheduler.setRootOrder('overlay', 10) // draws after the default-0 roots
+```
+
+### `setRootConstraints(rootId, constraints)`
+
+Replace one root's hard ordering dependencies:
+
+```ts
+scheduler.registerRoot('overlay', { after: 'main' })
+scheduler.setRootConstraints('overlay', { after: ['main', 'background'] })
+scheduler.setRootConstraints('overlay', {}) // clear both sets
+```
+
+`before` and `after` reference root ids, not job ids. Constraints override numeric `order`;
+numeric order and registration sequence remain the stable preference whenever several
+roots are otherwise available.
+
+References to roots that have not registered yet stay dormant and resolve automatically
+if they appear later. Circular dependencies warn and fall back to deterministic numeric /
+registration order for the affected roots, so every root still executes once.
+
+Registration order alone isn't stable — Suspense, conditional rendering, and remounts can
+reverse it — so roots that share a renderer and must draw in a fixed sequence should use
+root constraints rather than relying on mount timing.
+
+Ordering applies only to roots selected for that frame: a sleeping `demand` root ordered
+between two others is skipped, not woken to hold its place. Sorting happens when roots are
+added, removed, reordered, or given new constraints — never per frame.
+
+> Ordering reorders **whole roots**. Execution is root-major (each root runs all of its
+> phases before the next root starts), so "every canvas's physics, then every canvas's
+> render" is not expressible. Job-level `before`/`after` only resolves within one root.
 
 ### `unregisterRoot(id)`
 
@@ -188,6 +252,23 @@ Returns a unique id like `'root_0'`.
 ### `getRootCount(): number`
 
 Number of registered roots.
+
+### `getRootIds(): string[]`
+
+All registered root ids, in execution order. Without explicit root ordering this matches
+registration order.
+
+### `getRootFrameloop(rootId): Frameloop | undefined`
+
+One root's current mode, or `undefined` if the root is unknown. Since `scheduler.frameloop`
+only reports the default for new roots, this is how you ask what a specific root is doing.
+
+### `getJobRootId(jobId): string | undefined`
+
+Which root currently owns a job, or `undefined` if it isn't registered.
+
+Resolve this at call time rather than caching it — a host adopts ambient jobs when it
+registers, so an id captured earlier goes stale. @see [ambient root](./design/ambient-root.md)
 
 ---
 
@@ -325,14 +406,26 @@ const unsub = scheduler.subscribeJobState('my-job', () => {
 
 ### `start()` / `stop()`
 
-Start or stop the RAF loop. `start()` is a no-op if already running and is called
-automatically when the first root registers (under `frameloop='always'`); `stop()` is
-called automatically when the last root unregisters.
+Explicitly override the automatic root lifecycle. `start()` runs every root continuously;
+`stop()` cancels that override and holds the driver stopped. Normal root registration, mode
+changes, and invalidation automatically manage the driver without requiring these methods.
 
 ```ts
 scheduler.start()
 scheduler.stop()
 ```
+
+`stop()` is sticky. Routine lifecycle events — a root registering, unregistering, or
+changing mode — will **not** restart the driver while stopped, so a paused app stays paused
+when a new host mounts. What does resume it:
+
+| Action                                  | Resumes?                             |
+| --------------------------------------- | ------------------------------------ |
+| `start()`                               | yes                                  |
+| `invalidate()` / `invalidateRoot()`     | yes — an explicit request for frames |
+| `registerRoot()` / `setRootFrameloop()` | no                                   |
+| `scheduler.frameloop = …`               | no                                   |
+| `step()` / `stepRoot()`                 | runs the frame, driver stays stopped |
 
 ### `isRunning` (getter): `boolean`
 
@@ -345,15 +438,29 @@ scheduler.frameloop = 'demand'
 ```
 
 - `'always'` — continuous (default).
-- `'demand'` — render only when `invalidate()` is called.
-- `'never'` — manual; advance with `step()`.
+- `'demand'` — run when invalidated.
+- `'never'` — run during manual stepping.
 
-Switching to `'always'` starts the loop; switching away from it stops the loop.
+This property is the compatibility bulk control: setting it updates every existing root
+and sets the default for roots registered later. The getter returns that default.
+
+With more than one root this is last-writer-wins across hosts, so it warns once. Use
+[`setRootFrameloop`](#setrootframelooprootid-mode) for per-root control, or
+`defaultFrameloop` to change only the default.
+
+### `defaultFrameloop` (getter/setter)
+
+The mode given to roots registered without an explicit `frameloop`. Unlike `frameloop`,
+setting it leaves existing roots alone.
+
+```ts
+scheduler.defaultFrameloop = 'demand'
+scheduler.registerRoot('later') // starts in demand
+```
 
 ### `invalidate(frames?, stackFrames?)`
 
-Request frames in demand mode. Accumulates pending frames (capped at 60) and starts the
-loop if needed. No-op unless `frameloop === 'demand'`.
+Request frames for every demand root. Each root gets an independent pending count capped at 60. Always and never roots are unchanged.
 
 ```ts
 scheduler.invalidate() // one frame
@@ -362,13 +469,27 @@ scheduler.invalidate(3, false) // set pending to exactly 3
 scheduler.invalidate(2, true) // add 2 to the pending count
 ```
 
-Each executed frame decrements the pending count; when it hits 0 the loop stops and
-[`onIdle`](#onidlecallback) callbacks fire.
+Each demand root decrements its own pending count when it executes. The RAF stops and
+[`onIdle`](#onidlecallback) callbacks fire when no always root or pending demand root
+remains.
+
+### `invalidateRoot(rootId, frames?, stackFrames?)`
+
+Request frames for one demand root:
+
+```ts
+scheduler.invalidateRoot('my-root')
+scheduler.invalidateRoot('my-root', 5)
+scheduler.invalidateRoot('my-root', 2, true)
+```
+
+Invalidating during that root's callback schedules a subsequent frame; it is not consumed
+by the frame currently executing. Calls for always and never roots are no-ops.
 
 ### `resetTiming()`
 
-Reset `lastTime`, `frameCount`, and `elapsedTime` without touching jobs or roots. Mostly
-for deterministic tests.
+Reset the driver's frame counters and every root's accumulated time, without touching jobs
+or roots themselves. Mostly for deterministic tests.
 
 ---
 
@@ -384,6 +505,26 @@ scheduler.frameloop = 'never'
 scheduler.step() // run one frame
 scheduler.step(16.67) // run one frame at an explicit timestamp
 ```
+
+Note this runs **every** root, including `always` roots already being driven by the RAF. In
+a multi-root app, use `stepRoot` instead to avoid ticking those siblings twice.
+
+### `stepRoot(rootId, timestamp?)`
+
+Execute a single frame for one root, leaving its siblings untouched. This is the form to
+use when a host drives a `never` root from its own loop while other roots stay on the
+shared RAF driver:
+
+```ts
+scheduler.registerRoot('xr', { frameloop: 'never' })
+renderer.xr.setAnimationLoop((time) => scheduler.stepRoot('xr', time))
+```
+
+Like `step()`, it runs global before/after jobs and does **not** consume a pending demand
+frame. Unlike global `step()`, it does not advance the shared driver's timestamp, elapsed
+time, or frame count. The selected root uses its own manual-step interval, so interleaving
+an external root driver with RAF cannot shorten a sibling's next delta. An unknown root
+warns and is otherwise ignored.
 
 ### `stepJob(id, timestamp?)`
 
@@ -486,7 +627,7 @@ type Frameloop = 'always' | 'demand' | 'never'
 interface FrameTimingState {
   time: number // high-res RAF timestamp (ms)
   delta: number // seconds since last frame
-  elapsed: number // seconds since first frame
+  elapsed: number // seconds this root has been ticking (sleeping roots don't accrue)
   frame: number // incrementing counter
 }
 

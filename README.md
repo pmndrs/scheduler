@@ -2,7 +2,8 @@
 
 A small, **standalone**, framework-agnostic frame scheduler with **phases**, **priorities**, and **per-job FPS throttling**. One RAF loop, any renderer, no framework required.
 
-- **One RAF loop** for your whole app, across multiple roots
+- **One RAF loop** for your whole app, with independent lifecycle modes per root
+- **Cross-root ordering** with stable `order` preferences and `before`/`after` dependencies
 - **Phases** (`start → input → physics → update → render → finish`) you can extend at runtime
 - **Priorities** and cross-job `before`/`after` ordering (topological sort)
 - **FPS throttling** per job, with drop or catch-up semantics
@@ -46,6 +47,10 @@ scheduler.register(
 No host renderer or setup flag is required — registering a job lazily creates the
 scheduler's root and starts the loop. If a host (e.g. a `<Canvas>`) registers later, it
 adopts jobs already registered.
+
+Multi-root hosts still share one RAF driver, but each root can independently use `always`,
+`demand`, or `never`. Use `setRootFrameloop` and `invalidateRoot` when one canvas should
+sleep or wake without affecting its siblings.
 
 ## React
 

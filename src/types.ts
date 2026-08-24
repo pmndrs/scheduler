@@ -87,6 +87,30 @@ export interface RootOptions {
   getState?: () => any
   /** Error handler for job errors. Falls back to console.error if not provided. */
   onError?: (error: Error) => void
+  /** Root frame policy. Defaults to the scheduler's current frameloop setting. */
+  frameloop?: Frameloop
+  /**
+   * Execution order relative to other roots. Lower runs first; ties fall back to
+   * registration order. Defaults to `0`.
+   *
+   * Use this when roots share a renderer and one must draw before another —
+   * registration order alone is not stable under Suspense, conditional rendering,
+   * or remounts.
+   */
+  order?: number
+  /** Run this root before the referenced root id(s). */
+  before?: string | string[]
+  /** Run this root after the referenced root id(s). */
+  after?: string | string[]
+  /**
+   * Largest delta (in seconds) this root's callbacks can receive, capping how far
+   * it catches up after skipping frames.
+   *
+   * Defaults to one driver frame, so a root that slept resumes where it left off
+   * instead of fast-forwarding. Raise it to allow bounded catch-up, or set
+   * `Infinity` for true wall-clock deltas (v9 `THREE.Clock` behavior).
+   */
+  maxDelta?: number
 }
 
 //* Controls returned from useFrame --------------------------------
@@ -97,10 +121,20 @@ export interface FrameControls {
   id: string
   /** Access to the global scheduler for frame loop control */
   scheduler: SchedulerApi
+  /**
+   * The root that currently owns this job, or undefined if it isn't registered.
+   * Resolved on access, because host adoption can move a job between roots.
+   */
+  readonly rootId: string | undefined
   /** Manually step this job only (bypasses FPS limiting) */
   step(timestamp?: number): void
   /** Manually step ALL jobs in the scheduler */
   stepAll(timestamp?: number): void
+  /**
+   * Request frames for the root that owns this job. No-op when that root isn't
+   * in demand mode, or when this job isn't registered to a root.
+   */
+  invalidate(frames?: number, stackFrames?: boolean): void
   /** Pause this job (set enabled=false) */
   pause(): void
   /** Resume this job (set enabled=true) */
@@ -126,6 +160,9 @@ export interface SchedulerApi {
   unregisterRoot(id: string): void
   generateRootId(): string
   getRootCount(): number
+  getRootIds(): string[]
+  getRootFrameloop(rootId: string): Frameloop | undefined
+  getJobRootId(jobId: string): string | undefined
   readonly isReady: boolean
   onRootReady(callback: () => void): () => void
 
@@ -150,11 +187,17 @@ export interface SchedulerApi {
   stop(): void
   readonly isRunning: boolean
   frameloop: Frameloop
+  defaultFrameloop: Frameloop
+  setRootFrameloop(rootId: string, mode: Frameloop): void
+  setRootOrder(rootId: string, order: number): void
+  setRootConstraints(rootId: string, constraints: Pick<RootOptions, 'before' | 'after'>): void
 
   //* Manual Stepping
   step(timestamp?: number): void
+  stepRoot(rootId: string, timestamp?: number): void
   stepJob(id: string, timestamp?: number): void
   invalidate(frames?: number, stackFrames?: boolean): void
+  invalidateRoot(rootId: string, frames?: number, stackFrames?: boolean): void
 
   //* Per-Job Control
   isJobPaused(id: string): boolean
@@ -190,6 +233,13 @@ export interface Job {
   drop: boolean
   /** Last run timestamp (ms) */
   lastRun?: number
+  /**
+   * The owning root's `accumulatedTime` when this job last ran, in seconds.
+   * Differencing against it yields the time the root experienced since — which is
+   * the job's real delta when throttling made it skip frames, and excludes any
+   * span the root slept through.
+   */
+  lastRunElapsed?: number
   /** Whether job is enabled */
   enabled: boolean
   /** Internal flag: system jobs (like a default render) don't block user takeover */
@@ -231,14 +281,18 @@ export interface FrameLoopState {
   running: boolean
   /** Current RAF handle */
   rafHandle: number | null
-  /** Last frame timestamp in ms (null = uninitialized) */
+  /** Last shared RAF/global-step timestamp in ms; targeted steps never write it */
   lastTime: number | null
-  /** Frame counter */
+  /** Most recent positive shared frame interval in seconds, retained across RAF restarts */
+  lastFrameDelta: number | null
+  /** Shared RAF/global-step frame counter */
   frameCount: number
-  /** Elapsed time since first frame in ms */
+  /**
+   * Driver running time in ms. Not what callbacks receive — frame state carries
+   * the owning root's own accumulated time, which excludes frames it slept through.
+   * Targeted root steps do not advance this shared clock.
+   */
   elapsedTime: number
-  /** createdAt timestamp in ms */
-  createdAt: number
 }
 
 /**
@@ -256,6 +310,24 @@ export interface RootEntry {
   sortedJobs: Job[]
   /** Whether sortedJobs needs rebuilding */
   needsRebuild: boolean
+  /** Frame policy for this root */
+  frameloop: Frameloop
+  /** Demand frames waiting to be executed */
+  pendingFrames: number
+  /** Execution order; lower runs first, ties broken by `sequence` */
+  order: number
+  /** Registration sequence, for stable ordering between equal `order` values */
+  sequence: number
+  /** Root ids this root must execute before */
+  before: Set<string>
+  /** Root ids this root must execute after */
+  after: Set<string>
+  /** Timestamp of this root's last tick in ms (null = never ticked) */
+  lastTickTime: number | null
+  /** Sum of the deltas this root has received, in seconds */
+  accumulatedTime: number
+  /** Delta cap in seconds. undefined = one driver frame */
+  maxDelta: number | undefined
 }
 
 /**

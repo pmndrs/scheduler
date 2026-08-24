@@ -240,3 +240,83 @@ describe('useFrame — ambient & adoption', () => {
     expect(view!.container.textContent).toBe('true')
   })
 })
+
+//* Root-scoped Controls ==============================
+// A job needs a way to wake its OWN root without waking every sibling.
+// @see docs/superpowers/plans/2026-08-11-lifecycle-followups.md
+
+describe('useFrame root-scoped controls', () => {
+  it('reports the owning root and survives host adoption', () => {
+    const scheduler = Scheduler.get()
+    let controls: ReturnType<typeof useFrame> | undefined
+
+    function Runner() {
+      controls = useFrame(() => {})
+      return null
+    }
+
+    act(() => {
+      render(<Runner />)
+    })
+
+    // Registered before any host: the job sits on the ambient root.
+    expect(controls!.rootId).toBe(Scheduler.AMBIENT_ID)
+
+    act(() => {
+      scheduler.registerRoot('host')
+    })
+
+    // rootId is resolved on access, so adoption is reflected without a re-render.
+    expect(controls!.rootId).toBe('host')
+  })
+
+  it('invalidates only the root that owns the job', () => {
+    // Drive the RAF path, not step(): step() runs every root regardless of
+    // pending frames, so it can't distinguish targeted from global invalidation.
+    const frames = new Map<number, FrameRequestCallback>()
+    let nextId = 1
+    vi.stubGlobal('requestAnimationFrame', (cb: FrameRequestCallback) => {
+      const handle = nextId++
+      frames.set(handle, cb)
+      return handle
+    })
+    vi.stubGlobal('cancelAnimationFrame', (handle: number) => frames.delete(handle))
+
+    try {
+      const scheduler = Scheduler.get()
+      const calls: string[] = []
+      let controls: ReturnType<typeof useFrame> | undefined
+
+      scheduler.registerRoot('mine', { frameloop: 'demand' })
+      scheduler.registerRoot('other', { frameloop: 'demand' })
+      scheduler.register(() => calls.push('other'), { rootId: 'other' })
+
+      function Runner() {
+        controls = useFrame(() => calls.push('mine'), { id: 'mine-job' })
+        return null
+      }
+
+      act(() => {
+        render(<Runner />)
+      })
+      // No rootId option on the hook: a job defaults to the first registered root.
+      // Asserted rather than assumed, so the test's premise can't silently rot.
+      expect(controls!.rootId).toBe('mine')
+
+      act(() => {
+        controls!.invalidate()
+      })
+
+      act(() => {
+        const queued = [...frames.values()]
+        frames.clear()
+        for (const cb of queued) cb(1000)
+      })
+
+      // The sibling demand root stayed asleep.
+      expect(calls).toEqual(['mine'])
+    } finally {
+      vi.unstubAllGlobals()
+    }
+  })
+})
