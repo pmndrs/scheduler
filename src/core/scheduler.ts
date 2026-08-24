@@ -122,6 +122,7 @@ export class Scheduler {
     running: false,
     rafHandle: null,
     lastTime: null, // null = uninitialized, 0+ = valid timestamp
+    lastFrameDelta: null,
     frameCount: 0,
     elapsedTime: 0,
   }
@@ -915,6 +916,7 @@ export class Scheduler {
    */
   resetTiming(): void {
     this.loopState.lastTime = null
+    this.loopState.lastFrameDelta = null
     this.loopState.frameCount = 0
     this.loopState.elapsedTime = 0
 
@@ -950,7 +952,8 @@ export class Scheduler {
    * those siblings twice per frame.
    *
    * Like `step()`, it runs global before/after jobs and does NOT consume a
-   * pending demand frame.
+   * pending demand frame. Unlike the global step, it leaves the shared driver's
+   * timestamp, elapsed time, and frame count untouched.
    * @param {string} rootId - The root to execute
    * @param {number} [timestamp] - Optional timestamp (defaults to performance.now())
    * @returns {void}
@@ -965,7 +968,7 @@ export class Scheduler {
       return
     }
 
-    this.executeFrame(timestamp ?? performance.now(), [root])
+    this.executeFrame(timestamp ?? performance.now(), [root], false)
   }
 
   /**
@@ -1039,10 +1042,15 @@ export class Scheduler {
    * @param {number} timestamp - RAF timestamp in milliseconds
    * @param {'all' | 'automatic' | RootEntry[]} [execution] - Which roots run:
    *   every root, only those with automatic work, or an explicit list.
+   * @param {boolean} [advanceDriver=true] - Whether this frame advances shared driver timing.
    * @returns {void}
    * @private
    */
-  private executeFrame(timestamp: number, execution: 'all' | 'automatic' | RootEntry[] = 'all'): void {
+  private executeFrame(
+    timestamp: number,
+    execution: 'all' | 'automatic' | RootEntry[] = 'all',
+    advanceDriver: boolean = true,
+  ): void {
     // Snapshot root eligibility at the frame boundary so callback invalidations
     // cannot make later roots run in the same frame based on registration order.
     // getExecutionRoots() returns a cached array that is replaced, never mutated,
@@ -1054,13 +1062,28 @@ export class Scheduler {
           ? this.getExecutionRoots()
           : execution
 
-    // Update timing (RAF provides ms, convert delta to seconds for consistency with legacy THREE.Clock)
-    // Handle first frame case where lastTime is null - use timestamp as base (delta = 0)
-    const deltaMs = this.loopState.lastTime !== null ? timestamp - this.loopState.lastTime : 0
-    const delta = deltaMs / 1000 // Convert to seconds
-    this.loopState.lastTime = timestamp
-    this.loopState.frameCount++
-    this.loopState.elapsedTime += deltaMs // Keep elapsed in ms for internal tracking
+    let driverDelta: number
+
+    if (advanceDriver) {
+      // RAF provides ms; root callbacks receive seconds for legacy THREE.Clock parity.
+      const deltaMs = this.loopState.lastTime !== null ? timestamp - this.loopState.lastTime : 0
+      driverDelta = deltaMs / 1000
+
+      this.loopState.lastTime = timestamp
+      this.loopState.frameCount++
+      this.loopState.elapsedTime += deltaMs
+
+      // Keep the last real interval across RAF restarts. A restart intentionally
+      // clears lastTime to exclude the stopped span, but waking roots still need
+      // the same self-tuned default cap they had before the driver stopped.
+      if (driverDelta > 0) this.loopState.lastFrameDelta = driverDelta
+    } else {
+      // A targeted step is driven independently of the shared RAF. Its root still
+      // receives a useful manual-step delta, but no shared timing field changes,
+      // so an interleaved stepRoot cannot shorten a sibling's next RAF interval.
+      const previousRootTime = frameRoots[0]?.lastTickTime ?? null
+      driverDelta = previousRootTime !== null ? (timestamp - previousRootTime) / 1000 : 0
+    }
 
     // 1. Run globalBefore jobs (addEffect)
     this.runGlobalJobs(this.globalBeforeJobs, timestamp)
@@ -1069,7 +1092,7 @@ export class Scheduler {
     for (const root of frameRoots) {
       // A preceding callback may have removed a root after the frame snapshot.
       if (this.roots.get(root.id) !== root) continue
-      this.tickRoot(root, timestamp, delta)
+      this.tickRoot(root, timestamp, driverDelta)
     }
 
     // 3. Run globalAfter jobs (addAfterEffect)
@@ -1157,8 +1180,9 @@ export class Scheduler {
    * told it ran continuously — then capped, so one that slept resumes instead of
    * fast-forwarding. The cap defaults to a single driver frame, which makes this
    * identical to the driver delta for any root that runs every frame, and
-   * self-tunes across refresh rates. `maxDelta: Infinity` opts into wall-clock
-   * catch-up.
+   * self-tunes across refresh rates. The most recent positive driver interval is
+   * retained across RAF restarts so a wake frame does not collapse to zero.
+   * `maxDelta: Infinity` opts into wall-clock catch-up.
    * @param {RootEntry} root - The root about to tick
    * @param {number} timestamp - Frame timestamp in milliseconds
    * @param {number} driverDelta - Time since the driver's last frame in seconds
@@ -1169,7 +1193,8 @@ export class Scheduler {
     if (root.lastTickTime === null) return 0
 
     const rawDelta = (timestamp - root.lastTickTime) / 1000
-    return Math.max(0, Math.min(rawDelta, root.maxDelta ?? driverDelta))
+    const defaultMaxDelta = driverDelta > 0 ? driverDelta : (this.loopState.lastFrameDelta ?? 0)
+    return Math.max(0, Math.min(rawDelta, root.maxDelta ?? defaultMaxDelta))
   }
 
   /**

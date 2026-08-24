@@ -97,8 +97,8 @@ private executeFrame(timestamp: number, execution: 'all' | 'automatic' | RootEnt
 ```
 
 - [x] **Step 2:** Add `stepRoot(rootId, timestamp?)`. Warn and no-op on an unknown root, consistent with `setRootFrameloop` / `invalidateRoot`.
-- [x] **Step 3:** Document two deliberate choices in the JSDoc: it **does** run global before/after jobs (consistent with `step()`, so `addEffect` users keep working when XR drives the frame), and it does **not** consume a pending demand frame (also consistent with `step()`).
-- [x] **Step 4:** Tests — `stepRoot` ticks only the named root; an `always` sibling is not double-ticked; a `never` root is steppable; unknown root warns and no-ops.
+- [x] **Step 3:** Document three deliberate choices in the JSDoc: it **does** run global before/after jobs (consistent with `step()`, so `addEffect` users keep working when XR drives the frame), it does **not** consume a pending demand frame (also consistent with `step()`), and it does not advance shared driver timing.
+- [x] **Step 4:** Tests — `stepRoot` ticks only the named root; an `always` sibling is not double-ticked and keeps its full next RAF delta; a `never` root is steppable; unknown root warns and no-ops.
 
 ### Task 3: Make `stop()` sticky
 
@@ -194,6 +194,7 @@ Separating _measurement_ from _policy_ fixes both with one mechanism. For an `al
 
 - Produces: `RootOptions.maxDelta?: number` (seconds; default is one driver frame — see the deviation note below)
 - Produces: `RootEntry.lastTickTime: number | null`, `RootEntry.accumulatedTime: number`, `RootEntry.maxDelta: number | undefined`
+- Produces: `FrameLoopState.lastFrameDelta: number | null`, the last positive shared interval retained across RAF restarts
 
 - [x] **Step 1:** Compute timing per root in `tickRoot`:
 
@@ -205,17 +206,19 @@ root.accumulatedTime += delta
 // frameState: { time: timestamp, delta, elapsed: root.accumulatedTime, frame: this.loopState.frameCount }
 ```
 
-- [x] **Step 2:** Keep the shared `loopState` update in `executeFrame` — `time` and `frame` stay driver-scoped. Only `delta` and `elapsed` become per-root.
-- [x] **Step 3:** Reset `lastTickTime` to `null` on `registerRoot` and after ambient adoption, so a fresh root's first frame is `0` rather than a huge diff.
+- [x] **Step 2:** Keep the shared `loopState` update for RAF and global `step()` frames — `time` and `frame` stay driver-scoped. Targeted `stepRoot()` leaves it untouched. Only `delta` and `elapsed` become per-root.
+- [x] **Step 3:** Initialize `lastTickTime` to `null` on `registerRoot`, so a fresh root's first frame is `0` rather than a huge diff. Ambient adoption carries the existing root clock because ownership changes without creating a fresh timeline.
 - [x] **Step 4:** Apply the same per-root computation in the `stepJob` path.
 - [x] **Step 5:** Document the default in `docs/concepts.md`: sleeping roots do not accumulate time; a waking demand root receives at most `maxDelta`. Raising `maxDelta` restores v9-style catch-up; `Infinity` reproduces `THREE.Clock.getDelta()` exactly.
-- [x] **Step 6:** Tests — an `always` root's deltas are unchanged from current behavior; a waking demand root gets the same delta whether or not a sibling is running; `elapsed` equals the sum of the deltas that root received; `maxDelta: Infinity` restores catch-up. Plus: a late-registered root starts at `elapsed` 0, and adoption carries the ambient clock across.
+- [x] **Step 6:** Tests — an `always` root's deltas are unchanged from current behavior; a targeted `stepRoot()` cannot shorten its next RAF delta; a waking demand root gets the same nonzero delta whether or not a sibling keeps the driver running; `elapsed` equals the sum of the deltas that root received; `maxDelta: Infinity` restores catch-up. Plus: a late-registered root starts at `elapsed` 0, and adoption carries the ambient clock across.
 
-> **Deviation 1 — the default cap cannot be a constant.** The plan said `maxDelta` defaults to `1 / 60`, which is wrong: at 60Hz a real frame is often marginally _over_ 16.67ms, and on a 30Hz display every frame is 33ms. A constant default would clamp ordinary frames and halve animation speed on slower displays. The default is now **one driver frame** (`root.maxDelta ?? driverDelta`), which self-tunes to the refresh rate and is exactly the driver delta for any root that runs every frame — so the common path is provably unchanged. An explicit number still opts into bounded catch-up, `Infinity` into wall-clock.
+> **Deviation 1 — the default cap cannot be a constant.** The plan said `maxDelta` defaults to `1 / 60`, which is wrong: at 60Hz a real frame is often marginally _over_ 16.67ms, and on a 30Hz display every frame is 33ms. A constant default would clamp ordinary frames and halve animation speed on slower displays. The default is now **one driver frame**: the current positive interval, falling back to the last measured positive interval after a restart. It self-tunes to the refresh rate and is exactly the driver delta for any root that runs every frame — so the common path is provably unchanged. An explicit number still opts into bounded catch-up, `Infinity` into wall-clock.
 >
-> **Deviation 2 — `startLoop` no longer seeds `lastTime` from `performance.now()`.** Found by a failing test: after a full driver stop, the first frame's driver delta was measured between `performance.now()` at start and whatever timestamp the driver was fed. Those agree for RAF in a browser but not for injected timestamps, and the bogus interval became a bogus delta cap — a waking root teleported 8s in the test. `lastTime` now starts `null`, so the first frame after any (re)start reports a zero driver delta. This also makes the stopped-span exclusion exact instead of approximate.
+> **Deviation 2 — `startLoop` no longer seeds `lastTime` from `performance.now()`.** Found by a failing test: after a full driver stop, the first frame's driver delta was measured between `performance.now()` at start and whatever timestamp the driver was fed. Those agree for RAF in a browser but not for injected timestamps, and the bogus interval became a bogus delta cap — a waking root teleported 8s in the test. `lastTime` now starts `null`, so the current interval on the first frame after any (re)start is zero and the stopped span is excluded exactly. The root's default cap falls back to `lastFrameDelta`, preserving the previously measured cadence instead of reporting a zero wake delta.
 >
 > **Note on `stepJob`.** It reports a per-root delta but deliberately does **not** commit `lastTickTime` / `accumulatedTime`: stepping one job in isolation must not advance the root's frame clock and shrink the delta its next real frame receives. Its `elapsed` was also in milliseconds while `tickRoot`'s was in seconds; both are now seconds.
+>
+> **Note on `stepRoot`.** It commits the selected root's `lastTickTime` / `accumulatedTime`, but not shared `loopState` timing. Its manual cadence supplies that root's frame cap; an interleaved external tick therefore cannot shorten an unrelated RAF root's next delta.
 
 ### Task 7: Pause compensation and frame-count caveat
 
@@ -228,7 +231,7 @@ root.accumulatedTime += delta
 - [x] **Step 2:** Documented in `docs/concepts.md` that `frame` is a driver-scoped marker that resets when the RAF restarts, and shouldn't be used to derive state in demand-heavy apps. No code change, per your call that this is acceptable noise.
 - [x] **Step 3 (added):** `resetTiming()` now also clears every root's `lastTickTime` and `accumulatedTime`. Without it the method no longer did what its name promises, since the timing it used to reset had moved onto the roots.
 
-> **Left in place:** `loopState.elapsedTime` is still maintained but is no longer read by frame state. Kept as the driver's own running time — `resetTiming` documents it, and it is the natural surface for any future driver-level introspection. Flagged here so it isn't mistaken for an oversight.
+> **Left in place:** `loopState.elapsedTime` is still maintained but is no longer read by frame state. Kept as the driver's own running time — `resetTiming` documents it, and it is the natural surface for any future driver-level introspection. `loopState.lastFrameDelta` is separately retained across starts as the self-tuned default wake cap. Both are cleared by `resetTiming`.
 
 ---
 
@@ -348,7 +351,7 @@ Behavior changes for release notes:
 - The bulk `frameloop` setter warns with multiple roots.
 - `getRootIds()` returns execution order rather than Map order (identical unless root ordering is configured).
 
-**Not yet done:** `package.json` still says `0.1.0`. Bump and tag when you're ready to publish; r3f's dependency bump in Task 11 needs the published version.
+**Package version:** `package.json` is now `0.2.0`. The release still needs to be tagged and published before r3f can take the dependency in Task 11.
 
 ## Verification
 

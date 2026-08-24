@@ -1490,6 +1490,25 @@ describe('Scheduler per-root timing', () => {
     expect(deltas[2]).toBeCloseTo(0.016, 5)
   })
 
+  it("does not let stepRoot shorten an always sibling's next RAF delta", () => {
+    const raf = createRafController()
+    const scheduler = Scheduler.get()
+    const deltas: number[] = []
+
+    scheduler.registerRoot('always', { frameloop: 'always' })
+    scheduler.registerRoot('manual', { frameloop: 'never' })
+    scheduler.register((_state, delta) => deltas.push(delta), { rootId: 'always' })
+    scheduler.register(() => {}, { rootId: 'manual' })
+
+    raf.flush(1000)
+    raf.flush(1016)
+    scheduler.stepRoot('manual', 1024)
+    raf.flush(1032)
+
+    expect(deltas).toHaveLength(3)
+    expect(deltas[2]).toBeCloseTo(0.016, 5)
+  })
+
   it('caps a waking demand root at one driver frame instead of fast-forwarding', () => {
     const raf = createRafController()
     const scheduler = Scheduler.get()
@@ -1514,24 +1533,45 @@ describe('Scheduler per-root timing', () => {
     expect(deltas[1]).toBeCloseTo(0.016, 5)
   })
 
-  it('caps the wake delta whether or not a sibling kept the driver alive', () => {
-    const raf = createRafController()
-    const scheduler = Scheduler.get()
-    const deltas: number[] = []
+  it('reuses the measured driver interval when demand wakes after a full stop', () => {
+    const measureWakeDelta = (keepDriverActive: boolean): number => {
+      Scheduler.reset()
+      const raf = createRafController()
+      const scheduler = Scheduler.get()
+      const deltas: number[] = []
 
-    scheduler.registerRoot('demand', { frameloop: 'demand' })
-    scheduler.register((_state, delta) => deltas.push(delta), { rootId: 'demand' })
+      if (keepDriverActive) {
+        scheduler.registerRoot('always', { frameloop: 'always' })
+        scheduler.register(() => {}, { rootId: 'always' })
+      }
 
-    scheduler.invalidateRoot('demand')
-    raf.flush(1000)
-    expect(scheduler.isRunning).toBe(false) // driver stopped entirely
+      scheduler.registerRoot('demand', { frameloop: 'demand' })
+      scheduler.register((_state, delta) => deltas.push(delta), { rootId: 'demand' })
 
-    scheduler.invalidateRoot('demand')
-    raf.flush(9000) // 8 seconds later
+      // Two frames establish a real 20ms driver interval before demand sleeps.
+      scheduler.invalidateRoot('demand', 2)
+      raf.flush(1000)
+      raf.flush(1020)
 
-    expect(deltas).toHaveLength(2)
-    expect(deltas[1]).toBeLessThan(0.05) // bounded, no teleport
-    expect(deltas[1]).toBeGreaterThanOrEqual(0)
+      if (keepDriverActive) {
+        raf.flush(1040)
+        scheduler.invalidateRoot('demand')
+        raf.flush(1060)
+      } else {
+        expect(scheduler.isRunning).toBe(false)
+        scheduler.invalidateRoot('demand')
+        raf.flush(9000)
+      }
+
+      return deltas.at(-1)!
+    }
+
+    const activeDriverWakeDelta = measureWakeDelta(true)
+    const restartedDriverWakeDelta = measureWakeDelta(false)
+
+    expect(activeDriverWakeDelta).toBeGreaterThan(0)
+    expect(restartedDriverWakeDelta).toBeGreaterThan(0)
+    expect(restartedDriverWakeDelta).toBeCloseTo(activeDriverWakeDelta, 10)
   })
 
   it('accumulates elapsed from the deltas that root actually received', () => {

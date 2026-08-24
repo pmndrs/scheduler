@@ -281,13 +281,16 @@ export interface FrameLoopState {
   running: boolean
   /** Current RAF handle */
   rafHandle: number | null
-  /** Last frame timestamp in ms (null = uninitialized) */
+  /** Last shared RAF/global-step timestamp in ms; targeted steps never write it */
   lastTime: number | null
-  /** Frame counter */
+  /** Most recent positive shared frame interval in seconds, retained across RAF restarts */
+  lastFrameDelta: number | null
+  /** Shared RAF/global-step frame counter */
   frameCount: number
   /**
    * Driver running time in ms. Not what callbacks receive — frame state carries
    * the owning root's own accumulated time, which excludes frames it slept through.
+   * Targeted root steps do not advance this shared clock.
    */
   elapsedTime: number
 }

@@ -52,7 +52,7 @@ An automatically driven frame:
 
 1. Updates the scheduler's shared timing state once.
 2. Runs global-before jobs.
-3. Iterates roots in their existing registration order.
+3. Iterates roots in resolved root execution order.
 4. Runs every `always` root.
 5. Runs a `demand` root only when its `pendingFrames` is greater than zero.
 6. Skips every `never` root.
@@ -63,16 +63,20 @@ A demand frame is consumed before its root callbacks run. If a callback invalida
 root again, the new request remains pending for the next RAF instead of being removed by a
 post-callback decrement.
 
-Timing remains scheduler-wide. Roots that execute on the same RAF receive the same
-timestamp, delta, elapsed time, and frame number. Introducing per-root clocks is outside
-this change.
+The lifecycle implementation initially left timing scheduler-wide, but the timing follow-up
+completed before release: roots on the same RAF share `time` and `frame`, while `delta` and
+`elapsed` belong to each root. Sleeping roots therefore do not fast-forward. The default
+wake cap uses the current driver interval and retains the last positive interval across RAF
+restarts.
 
 ## Manual driver behavior
 
 Calling `start()` explicitly continues to force a continuous loop and executes all roots,
 matching the current low-level behavior. Automatic starts caused by root lifecycle state
 do not enable that override. `stop()` cancels either form of loop. `step()` synchronously
-executes all roots once without changing automatic lifecycle state.
+executes all roots once without changing automatic lifecycle state. `stepRoot()` executes
+one root without advancing shared RAF timing, so an external root driver cannot perturb an
+automatic sibling's next delta.
 
 ## Registration and adoption
 

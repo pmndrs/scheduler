@@ -321,8 +321,10 @@ scheduler.invalidateRoot('hero')
 // delta is ~0.016, not 8. The animation resumes; it doesn't jump forward.
 ```
 
-That cap defaults to one driver frame, which self-tunes across refresh rates. Raise it per
-root to allow bounded catch-up, or opt into true wall-clock deltas:
+That cap defaults to one driver frame, which self-tunes across refresh rates. The scheduler
+retains the last positive interval when the RAF stops, so the first wake frame after a
+restart uses the same cap instead of collapsing to zero. Raise it per root to allow bounded
+catch-up, or opt into true wall-clock deltas:
 
 ```ts
 scheduler.registerRoot('sim', { frameloop: 'demand', maxDelta: 0.1 }) // catch up, bounded
@@ -336,6 +338,10 @@ glitch.
 > `frame` counts driver frames and resets whenever the RAF restarts, so it is a frame
 > _marker_, not a stable per-root counter. In demand-heavy apps that start and stop the
 > driver often, don't derive state from it.
+>
+> `stepRoot()` is a targeted external-driver tick: it advances only that root's timing and
+> leaves the shared driver's `time`, `frame`, and elapsed clock untouched. Global `step()`
+> remains a full shared frame.
 
 ## A real game loop
 

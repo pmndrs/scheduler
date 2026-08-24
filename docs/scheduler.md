@@ -183,7 +183,8 @@ scheduler.registerRoot('standalone')
 - Roots share one RAF driver and its `time` / `frame`, but their mode, pending demand
   frames, `delta`, and `elapsed` are independent — a sleeping root doesn't accumulate time
   it never saw. `maxDelta` caps how far a root catches up after skipping frames; the default
-  of one driver frame means a waking root resumes rather than jumping. See
+  uses the current driver interval, or the last measured positive interval after a restart,
+  so a waking root resumes rather than jumping or receiving zero. See
   [Timing](./concepts.md#timing).
 - The last root to unregister stops the loop.
 
@@ -520,7 +521,10 @@ renderer.xr.setAnimationLoop((time) => scheduler.stepRoot('xr', time))
 ```
 
 Like `step()`, it runs global before/after jobs and does **not** consume a pending demand
-frame. An unknown root warns and is otherwise ignored.
+frame. Unlike global `step()`, it does not advance the shared driver's timestamp, elapsed
+time, or frame count. The selected root uses its own manual-step interval, so interleaving
+an external root driver with RAF cannot shorten a sibling's next delta. An unknown root
+warns and is otherwise ignored.
 
 ### `stepJob(id, timestamp?)`
 
