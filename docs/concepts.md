@@ -202,6 +202,12 @@ Tier 3 matters if you reference a job that hasn't registered yet, or one in a **
 root**: job dependencies only resolve within a single root. Order whole roots with
 [root constraints](./scheduler.md#setrootconstraintsrootid-constraints) instead.
 
+A job with an **explicit** `phase` keeps it even when a `before`/`after` target lives in
+another phase. If phase order already satisfies the constraint (`{ phase: 'render', after:
+'camera' }` with `camera` in `update`) nothing happens; if it contradicts it (`{ phase:
+'update', after: 'camera' }` with `camera` in `render`) the scheduler warns once and the
+explicit phase wins. Move the job or drop the constraint to clear the warning.
+
 ## FPS throttling and frame budget management
 
 Not all work needs 60fps. Expensive operations can run slower without hurting perceived

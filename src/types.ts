@@ -249,6 +249,8 @@ export interface Job {
   enabled: boolean
   /** Internal flag: system jobs (like a default render) don't block user takeover */
   system?: boolean
+  /** Whether an unsatisfiable cross-phase constraint has already been reported for this job */
+  constraintWarned?: boolean
 }
 
 /**

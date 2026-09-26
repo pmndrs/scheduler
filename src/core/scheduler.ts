@@ -682,6 +682,8 @@ export class Scheduler {
       if (options.phase) job.phase = options.phase
       if (options.before !== undefined) job.before = this.normalizeConstraints(options.before)
       if (options.after !== undefined) job.after = this.normalizeConstraints(options.after)
+      // New placement, new chance to contradict the phase order: report it again.
+      job.constraintWarned = false
       root.needsRebuild = true
     }
   }

@@ -2453,3 +2453,89 @@ describe('Scheduler per-root error handling', () => {
     errorSpy.mockRestore()
   })
 })
+
+//* Cross-phase constraint contradictions ==============================
+
+describe('Scheduler cross-phase constraint warnings', () => {
+  let warn: ReturnType<typeof vi.spyOn>
+
+  beforeEach(() => {
+    Scheduler.reset()
+    warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+  })
+
+  afterEach(() => {
+    warn.mockRestore()
+    Scheduler.reset()
+  })
+
+  it('warns once when an explicit phase contradicts an after: job-id constraint', () => {
+    const scheduler = Scheduler.get()
+    scheduler.frameloop = 'never'
+    const order: string[] = []
+
+    scheduler.register(() => order.push('camera'), { id: 'camera', phase: 'render' })
+    scheduler.register(() => order.push('follow'), { id: 'follow', phase: 'update', after: 'camera' })
+
+    scheduler.step(0)
+    scheduler.step(16)
+
+    expect(warn).toHaveBeenCalledTimes(1)
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining('Job "follow" asks to run after "camera"'))
+    // The explicit phase wins: update still runs before render.
+    expect(order.slice(0, 2)).toEqual(['follow', 'camera'])
+  })
+
+  it('does not warn when phase order already satisfies a cross-phase constraint', () => {
+    const scheduler = Scheduler.get()
+    scheduler.frameloop = 'never'
+
+    scheduler.register(() => {}, { id: 'camera', phase: 'update' })
+    scheduler.register(() => {}, { id: 'follow', phase: 'render', after: 'camera' })
+    scheduler.register(() => {}, { id: 'prep', phase: 'update', before: 'render' })
+
+    scheduler.step(0)
+    expect(warn).not.toHaveBeenCalled()
+  })
+
+  it('warns when an explicit phase contradicts a before: phase-name constraint', () => {
+    const scheduler = Scheduler.get()
+    scheduler.frameloop = 'never'
+
+    scheduler.register(() => {}, { id: 'late', phase: 'render', before: 'update' })
+
+    scheduler.step(0)
+    expect(warn).toHaveBeenCalledTimes(1)
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining('a phase that runs earlier'))
+  })
+
+  it('re-warns only after the constraints change again', () => {
+    const scheduler = Scheduler.get()
+    scheduler.frameloop = 'never'
+
+    scheduler.register(() => {}, { id: 'camera', phase: 'render' })
+    scheduler.register(() => {}, { id: 'follow', phase: 'update', after: 'camera' })
+
+    scheduler.step(0)
+    scheduler.updateJob('follow', { priority: 5 }) // no placement change
+    scheduler.step(16)
+    expect(warn).toHaveBeenCalledTimes(1)
+
+    scheduler.updateJob('follow', { phase: 'render' }) // now satisfiable
+    scheduler.step(32)
+    expect(warn).toHaveBeenCalledTimes(1)
+
+    scheduler.updateJob('follow', { phase: 'input' }) // contradicts again
+    scheduler.step(48)
+    expect(warn).toHaveBeenCalledTimes(2)
+  })
+
+  it('ignores targets that are neither a phase nor a job in this root', () => {
+    const scheduler = Scheduler.get()
+    scheduler.frameloop = 'never'
+
+    scheduler.register(() => {}, { id: 'a', phase: 'update', after: 'not-registered-yet' })
+    scheduler.step(0)
+    expect(warn).not.toHaveBeenCalled()
+  })
+})

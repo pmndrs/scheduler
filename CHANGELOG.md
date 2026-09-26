@@ -2,6 +2,7 @@
 
 //* Unreleased ===============================================================
 
+- A `before`/`after` constraint that the phase order makes impossible (`{ phase: 'update', after: 'camera' }` with `camera` in `render`) now warns once per job instead of being silently ignored. The explicit phase still wins.
 - `onError` is now per root: a job error dispatches to the handler of the root that owns the job. Previously the last-registered root's handler received every root's errors. Roots without a handler fall back to the scheduler-wide one, then `console.error`.
 - Fixed: the unsubscribe returned by `register()` / `useFrame` did nothing once a host had adopted the job from the ambient root, so unmounted `useFrame` callbacks kept running. It now removes exactly the job it registered, wherever it lives.
 - Fixed: a callback that stopped and restarted the driver (`stop()` + `start()`, or unregistering the last root and registering another) left two RAF loops alive, ticking every job twice per frame.

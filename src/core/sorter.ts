@@ -37,6 +37,8 @@ export function rebuildSortedJobs(jobs: Map<string, Job>, phaseGraph: PhaseGraph
     bucket.push(job)
   }
 
+  warnUnsatisfiableConstraints(buckets, orderedPhases)
+
   // Sort each bucket --------------------------------
   const sortedBuckets: Job[][] = []
 
@@ -67,6 +69,62 @@ export function rebuildSortedJobs(jobs: Map<string, Job>, phaseGraph: PhaseGraph
 
   // Concatenate all buckets
   return sortedBuckets.flat()
+}
+
+//* Cross-Phase Constraint Validation --------------------------------
+
+/**
+ * Report constraints the phase order makes impossible to honor.
+ *
+ * Job-level `before`/`after` only reorders jobs inside one phase. A target in
+ * another phase is fine when phase order already satisfies the constraint
+ * (`{ phase: 'render', after: 'camera' }` with `camera` in `update`) — that is
+ * simply redundant. It is a contradiction when the phases run the other way
+ * (`{ phase: 'update', after: 'camera' }` with `camera` in `render`), and the
+ * job's explicit phase silently wins. Warn once per job so the mistake is
+ * visible without moving the job out of the phase it asked for.
+ */
+function warnUnsatisfiableConstraints(buckets: Map<string, Job[]>, orderedPhases: string[]): void {
+  const phaseIndex = new Map<string, number>()
+  orderedPhases.forEach((phase, index) => phaseIndex.set(phase, index))
+
+  const jobPhase = new Map<string, string>()
+  for (const [phase, bucket] of buckets) {
+    for (const job of bucket) jobPhase.set(job.id, phase)
+  }
+
+  for (const bucket of buckets.values()) {
+    for (const job of bucket) {
+      if (job.constraintWarned) continue
+      const ownIndex = phaseIndex.get(job.phase)
+      if (ownIndex === undefined) continue
+
+      const check = (ref: string, direction: 'before' | 'after') => {
+        // A target names a phase or a job id; resolve to a phase either way.
+        const targetPhase = phaseIndex.has(ref) ? ref : jobPhase.get(ref)
+        if (targetPhase === undefined || targetPhase === job.phase) return false
+        const targetIndex = phaseIndex.get(targetPhase)
+        if (targetIndex === undefined) return false
+
+        const contradiction = direction === 'before' ? ownIndex > targetIndex : ownIndex < targetIndex
+        if (!contradiction) return false
+
+        const targetKind = phaseIndex.has(ref) ? 'phase' : `job (in the "${targetPhase}" phase)`
+        console.warn(
+          `[Scheduler] Job "${job.id}" asks to run ${direction} "${ref}", a ${targetKind} that runs ` +
+            `${direction === 'before' ? 'earlier' : 'later'} than its own "${job.phase}" phase. ` +
+            `Cross-phase constraints only order jobs within a phase; the explicit phase wins. ` +
+            `Move the job, or drop the constraint.`,
+        )
+        return true
+      }
+
+      let warned = false
+      for (const ref of job.before) if (check(ref, 'before')) warned = true
+      for (const ref of job.after) if (check(ref, 'after')) warned = true
+      if (warned) job.constraintWarned = true
+    }
+  }
 }
 
 //* Cross-Job Constraint Detection --------------------------------
