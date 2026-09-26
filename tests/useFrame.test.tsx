@@ -508,3 +508,36 @@ describe('useFrame stable jobs', () => {
     expect(new Set(ids).size).toBe(2)
   })
 })
+
+describe('useFrame in the fixed physics phase', () => {
+  it('hands a physics job a fixed delta and exposes overstep on state for a render job', () => {
+    const scheduler = Scheduler.get()
+    const deltas: number[] = []
+    let overstep = -1
+
+    function Sim() {
+      useFrame((_s, dt) => deltas.push(dt), { phase: 'physics' })
+      return null
+    }
+    function Draw() {
+      useFrame((state) => void (overstep = state.overstep), { phase: 'render' })
+      return null
+    }
+
+    act(() => {
+      render(
+        <>
+          <Sim />
+          <Draw />
+        </>,
+      )
+    })
+
+    act(() => {
+      scheduler.step(0)
+      scheduler.step(25) // 1.5 substeps banked
+    })
+    expect(deltas).toEqual([1 / 60])
+    expect(overstep).toBeCloseTo(0.5, 9)
+  })
+})

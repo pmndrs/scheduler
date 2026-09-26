@@ -26,7 +26,7 @@ Global Scheduler (RAF loop)
 ├── For each registered root:
 │   ├── start phase
 │   ├── input phase
-│   ├── physics phase
+│   ├── physics phase (fixed timestep, 1/60)
 │   ├── update phase (default)
 │   ├── render phase
 │   └── finish phase
@@ -111,6 +111,9 @@ const unsub = scheduler.onRootReady(() => {
 ## Phase management
 
 Default phases, in order: `start`, `input`, `physics`, `update`, `render`, `finish`.
+`physics` is a **fixed phase** at `1 / 60`: its jobs run once per whole timestep banked from
+the root's clock, each time with `delta === 1 / 60`. See
+[Concepts → Fixed timestep](./concepts.md#fixed-timestep-the-physics-phase).
 
 ### `addPhase(name, options?)`
 
@@ -120,16 +123,51 @@ Insert a named phase into the execution order.
 interface AddPhaseOptions {
   before?: string // insert before this phase
   after?: string // insert after this phase
+  timestep?: number // seconds per substep; makes this a fixed phase
+  maxSubsteps?: number // most substeps per frame before surplus is dropped (default: 8)
 }
 ```
 
 ```ts
-scheduler.addPhase('physics', { before: 'update' })
+scheduler.addPhase('ai', { before: 'update' })
 scheduler.addPhase('postprocess', { after: 'render' })
+scheduler.addPhase('cloth', { after: 'physics', timestep: 1 / 30 }) // a second fixed phase
 scheduler.addPhase('cleanup') // append to the end
 ```
 
 Adding a phase marks all roots for rebuild. Duplicate names are ignored with a warning.
+
+### `setPhaseTimestep(name, timestep, options?)`
+
+Give a phase a fixed timestep, change it, or pass `undefined` to make it per-frame again.
+A changed timestep resets that phase's clock on every root.
+
+```ts
+scheduler.setPhaseTimestep('physics', 1 / 120)
+scheduler.setPhaseTimestep('physics', 1 / 60, { maxSubsteps: 4 })
+scheduler.setPhaseTimestep('physics', undefined) // per-frame
+```
+
+Invalid values warn and are ignored. An unknown phase warns.
+
+### `getPhaseTimestep(name): number | undefined`
+
+```ts
+scheduler.getPhaseTimestep('physics') // 0.01666… by default
+scheduler.getPhaseTimestep('update') // undefined
+```
+
+### `getOverstep(phase?, rootId?): number`
+
+The fraction of a fixed phase's next substep already banked on a root, in `[0, 1)` — the
+interpolation factor between that phase's previous and current states. Frame callbacks get
+the first fixed phase's value as `state.overstep`; this is the general form for a second
+fixed phase or for reading outside a callback. Defaults to the first fixed phase and the
+first registered root. `0` when there is no such clock.
+
+```ts
+scheduler.getOverstep('cloth', 'main')
+```
 
 ### `hasPhase(name): boolean`
 
@@ -314,7 +352,7 @@ scheduler.register(
   (state, delta) => {
     /* physics */
   },
-  { id: 'physics-sim', phase: 'physics', priority: 10, fps: 60 },
+  { id: 'physics-sim', phase: 'physics', priority: 10 }, // fixed phase: dt is 1/60 every call
 )
 
 unsub() // cleanup
@@ -341,6 +379,10 @@ Notes:
 - The returned unsubscribe removes exactly the job it registered, wherever it lives by then
   (a host may have adopted it), and is a no-op if a later registration replaced it.
 - A throttled (`fps`) job always runs on its first frame, then waits its interval.
+- A job in a fixed phase (`physics` by default) is invoked with exactly the phase's timestep
+  as its delta, as many times per frame as the root's clock requires. `fps` is ignored
+  there with a warning. See
+  [Fixed timestep](./concepts.md#fixed-timestep-the-physics-phase).
 
 ### `unregister(id, rootId?)`
 
@@ -608,7 +650,7 @@ describe('animation system', () => {
     let position = 0
     scheduler.register(
       (state, delta) => {
-        position += delta * 10
+        position += delta * 10 // delta is exactly 1/60: physics is a fixed phase
       },
       { phase: 'physics' },
     )
@@ -617,7 +659,7 @@ describe('animation system', () => {
     scheduler.step(16.67) // ~60fps
     scheduler.step(33.34)
 
-    expect(position).toBeGreaterThan(0)
+    expect(position).toBeCloseTo(2 * (1 / 60) * 10)
   })
 })
 ```
@@ -644,9 +686,10 @@ type Frameloop = 'always' | 'demand' | 'never'
 
 interface FrameTimingState {
   time: number // high-res RAF timestamp (ms)
-  delta: number // seconds since last frame
-  elapsed: number // seconds this root has been ticking (sleeping roots don't accrue)
+  delta: number // seconds since last frame; the phase's timestep inside a fixed phase
+  elapsed: number // sum of the deltas this callback has received (sleeping roots don't accrue)
   frame: number // incrementing counter
+  overstep: number // [0, 1): fraction of the next fixed substep banked, for interpolation
 }
 
 // Default callback state is timing-only. Pass T to type injected root state.
@@ -666,6 +709,8 @@ interface UseFrameOptions {
 interface AddPhaseOptions {
   before?: string
   after?: string
+  timestep?: number
+  maxSubsteps?: number
 }
 ```
 

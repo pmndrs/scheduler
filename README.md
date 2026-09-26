@@ -6,7 +6,7 @@ A small, **standalone**, framework-agnostic frame scheduler with **phases**, **p
 - **Cross-root ordering** with stable `order` preferences and `before`/`after` dependencies
 - **Phases** (`start → input → physics → update → render → finish`) you can extend at runtime
 - **Priorities** and cross-job `before`/`after` ordering (topological sort)
-- **FPS throttling** per job, with drop or catch-up semantics
+- **FPS throttling** per job, and a **fixed-timestep** `physics` phase (1/60) with `overstep` for interpolation
 - **Demand** (`invalidate`) and **manual** (`step`) frame modes
 - Zero dependencies. Vanilla core pulls in **no React**.
 
@@ -86,7 +86,7 @@ you declare ordering, it figures out the sequence — no priority-number guessin
 scheduler.addPhase('ai', { after: 'physics', before: 'update' })
 
 scheduler.register(processInput, { phase: 'input' })
-scheduler.register(() => world.step(1 / 60), { phase: 'physics', fps: 60, drop: false })
+scheduler.register((state, dt) => world.step(dt), { phase: 'physics' }) // dt is a fixed 1/60
 scheduler.register(updateAI, { phase: 'ai', fps: 20 })
 scheduler.register(render, { phase: 'render' })
 ```
