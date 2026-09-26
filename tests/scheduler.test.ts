@@ -2345,3 +2345,111 @@ describe('Scheduler audit regressions', () => {
     warn.mockRestore()
   })
 })
+
+//* Per-root error handlers ==============================
+
+describe('Scheduler per-root error handling', () => {
+  beforeEach(() => {
+    Scheduler.reset()
+  })
+
+  afterEach(() => {
+    Scheduler.reset()
+  })
+
+  const boom = () => {
+    throw new Error('boom')
+  }
+
+  it('routes a job error to the handler of the root that owns it, not the last-registered root', () => {
+    const scheduler = Scheduler.get()
+    scheduler.frameloop = 'never'
+    const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {})
+    const seenByA: Error[] = []
+    const seenByB: Error[] = []
+
+    scheduler.registerRoot('a', { onError: (e) => seenByA.push(e) })
+    scheduler.registerRoot('b', { onError: (e) => seenByB.push(e) })
+    scheduler.register(boom, { id: 'a-job', rootId: 'a' })
+
+    scheduler.step(1000)
+
+    expect(seenByA).toHaveLength(1)
+    expect(seenByA[0].message).toBe('boom')
+    expect(seenByB).toHaveLength(0)
+
+    errorSpy.mockRestore()
+  })
+
+  it('falls back to the scheduler-wide handler for a root without its own', () => {
+    const scheduler = Scheduler.get()
+    scheduler.frameloop = 'never'
+    const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {})
+    const seen: Error[] = []
+
+    scheduler.registerRoot('host', { onError: (e) => seen.push(e) })
+    scheduler.registerRoot('bare')
+    scheduler.register(boom, { rootId: 'bare' })
+
+    scheduler.step(1000)
+
+    expect(seen).toHaveLength(1)
+    errorSpy.mockRestore()
+  })
+
+  it('uses the adopting host handler for an orphan that threw with no host', () => {
+    const scheduler = Scheduler.get()
+    scheduler.frameloop = 'never'
+    const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {})
+    const seen: Error[] = []
+
+    scheduler.register(boom, { id: 'orphan' })
+    scheduler.step(1000) // ambient: console only
+    expect(errorSpy).toHaveBeenCalledTimes(1)
+    expect(seen).toHaveLength(0)
+
+    scheduler.registerRoot('host', { onError: (e) => seen.push(e) })
+    scheduler.step(2000)
+    expect(seen).toHaveLength(1)
+
+    errorSpy.mockRestore()
+  })
+
+  it('routes stepJob() errors to the owning root as well', () => {
+    const scheduler = Scheduler.get()
+    scheduler.frameloop = 'never'
+    const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {})
+    const seenByA: Error[] = []
+    const seenByB: Error[] = []
+
+    scheduler.registerRoot('a', { onError: (e) => seenByA.push(e) })
+    scheduler.registerRoot('b', { onError: (e) => seenByB.push(e) })
+    scheduler.register(boom, { id: 'a-job', rootId: 'a' })
+
+    scheduler.stepJob('a-job', 1000)
+
+    expect(seenByA).toHaveLength(1)
+    expect(seenByB).toHaveLength(0)
+    errorSpy.mockRestore()
+  })
+
+  it('wraps non-Error throwables before dispatching', () => {
+    const scheduler = Scheduler.get()
+    scheduler.frameloop = 'never'
+    const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {})
+    const seen: Error[] = []
+
+    scheduler.registerRoot('a', { onError: (e) => seen.push(e) })
+    scheduler.register(
+      () => {
+        throw 'plain string'
+      },
+      { rootId: 'a' },
+    )
+    scheduler.step(1000)
+
+    expect(seen[0]).toBeInstanceOf(Error)
+    expect(seen[0].message).toBe('plain string')
+    errorSpy.mockRestore()
+  })
+})

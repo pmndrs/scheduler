@@ -85,7 +85,12 @@ export type FrameNextCallback = FrameCallback
 export interface RootOptions {
   /** State provider for callbacks. Optional for hostless (standalone) roots. */
   getState?: () => any
-  /** Error handler for job errors. Falls back to console.error if not provided. */
+  /**
+   * Error handler for this root's jobs. Each root gets its own: an error thrown
+   * by a job on one canvas never reaches another canvas's handler. Also becomes
+   * the scheduler-wide fallback used by {@link SchedulerApi.triggerError}.
+   * Falls back to console.error if not provided.
+   */
   onError?: (error: Error) => void
   /** Root frame policy. Defaults to the scheduler's current frameloop setting. */
   frameloop?: Frameloop
@@ -304,6 +309,8 @@ export interface RootEntry {
   id: string
   /** Function to get the root's current state. Returns any to support hostless roots. */
   getState: () => any
+  /** Error handler for this root's jobs. Falls back to the scheduler-wide handler. */
+  onError?: (error: Error) => void
   /** Map of job IDs to Job objects */
   jobs: Map<string, Job>
   /** Cached sorted job list for execution order */

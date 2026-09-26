@@ -2,6 +2,7 @@
 
 //* Unreleased ===============================================================
 
+- `onError` is now per root: a job error dispatches to the handler of the root that owns the job. Previously the last-registered root's handler received every root's errors. Roots without a handler fall back to the scheduler-wide one, then `console.error`.
 - Fixed: the unsubscribe returned by `register()` / `useFrame` did nothing once a host had adopted the job from the ambient root, so unmounted `useFrame` callbacks kept running. It now removes exactly the job it registered, wherever it lives.
 - Fixed: a callback that stopped and restarted the driver (`stop()` + `start()`, or unregistering the last root and registering another) left two RAF loops alive, ticking every job twice per frame.
 - Fixed: unthrottled jobs received a fresh copy of the frame state nearly every frame because their delta was re-derived by float differencing. They now share the root's state object and exact delta; only `fps`-throttled jobs get their own interval. Roughly 9x less per-job overhead on large roots.

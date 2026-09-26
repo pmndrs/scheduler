@@ -232,6 +232,7 @@ export class Scheduler {
     const entry: RootEntry = {
       id,
       getState: options.getState ?? (() => ({})),
+      onError: options.onError,
       jobs: new Map(),
       sortedJobs: [],
       needsRebuild: false,
@@ -246,8 +247,9 @@ export class Scheduler {
       maxDelta: options.maxDelta,
     }
 
-    // Bind error handler from root
-    // Always update if provided - allows new roots to override stale handlers
+    // Job errors dispatch to the owning root's handler (above). The scheduler-wide
+    // handler only backs `triggerError()` and roots without their own; always
+    // update it so new roots override stale handlers.
     // @see https://github.com/pmndrs/react-three-fiber/issues/3651
     if (options.onError) {
       this.errorHandler = options.onError
@@ -403,14 +405,31 @@ export class Scheduler {
   }
 
   /**
-   * Trigger error handling for job errors.
-   * Uses the bound error handler if available, otherwise logs to console.
+   * Trigger error handling outside any root context.
+   * Uses the scheduler-wide handler (the most recent root's `onError`) if
+   * available, otherwise logs to console. Job errors don't go through here —
+   * they dispatch to the owning root's handler.
    * @param {Error} error - The error to handle
    * @returns {void}
    */
   triggerError(error: Error): void {
     if (this.errorHandler) this.errorHandler(error)
     else console.error('[Scheduler]', error)
+  }
+
+  /**
+   * Report an error thrown by one of a root's jobs: log it with the job id, then
+   * dispatch to that root's `onError`, falling back to the scheduler-wide handler.
+   * @param {RootEntry} root - The root whose job threw
+   * @param {string} jobId - The job that threw
+   * @param {unknown} error - Whatever was thrown
+   * @returns {void}
+   * @private
+   */
+  private reportJobError(root: RootEntry, jobId: string, error: unknown): void {
+    console.error(`[Scheduler] Error in job "${jobId}":`, error)
+    const handler = root.onError ?? this.errorHandler
+    if (handler) handler(error instanceof Error ? error : new Error(String(error)))
   }
 
   //* Phase Management Methods ================================
@@ -1043,8 +1062,7 @@ export class Scheduler {
     try {
       job.callback(frameState, delta)
     } catch (error) {
-      console.error(`[Scheduler] Error in job "${job.id}":`, error)
-      this.triggerError(error instanceof Error ? error : new Error(String(error)))
+      this.reportJobError(root, job.id, error)
     }
   }
 
@@ -1161,7 +1179,7 @@ export class Scheduler {
   /**
    * Execute all jobs for a single root in sorted order.
    * Rebuilds sorted job list if needed, then dispatches each job.
-   * Errors are caught and propagated via triggerError.
+   * Errors are caught and dispatched to the root's error handler.
    * @param {RootEntry} root - The root entry to tick
    * @param {number} timestamp - RAF timestamp in milliseconds
    * @param {number} driverDelta - Time since the driver's last frame in seconds
@@ -1215,9 +1233,7 @@ export class Scheduler {
       try {
         job.callback(jobState, jobDelta)
       } catch (error) {
-        console.error(`[Scheduler] Error in job "${job.id}":`, error)
-        // Propagate error via pluggable handler
-        this.triggerError(error instanceof Error ? error : new Error(String(error)))
+        this.reportJobError(root, job.id, error)
       }
     }
   }

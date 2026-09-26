@@ -185,6 +185,9 @@ scheduler.registerRoot('standalone')
 
 - `getState` is how a host injects its own state (r3f injects its `RootState`). Whatever it
   returns is spread into the object passed to every job callback, alongside timing.
+- `onError` is per root: an error thrown by one of this root's jobs goes to this handler,
+  never to another root's. A root without one falls back to the most recently registered
+  handler, then to `console.error`. That same fallback backs `triggerError()`.
 - Roots share one RAF driver and its `time` / `frame`, but their mode, pending demand
   frames, `delta`, and `elapsed` are independent — a sleeping root doesn't accumulate time
   it never saw. `maxDelta` caps how far a root catches up after skipping frames; the default
