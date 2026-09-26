@@ -16,9 +16,12 @@ import type {
   RootEntry,
   GlobalJob,
   FrameLoopState,
+  FixedClock,
+  PhaseBucket,
+  PhaseTimestepOptions,
 } from '../types'
 import { PhaseGraph } from './phaseGraph'
-import { rebuildSortedJobs } from './sorter'
+import { rebuildPhaseBuckets } from './sorter'
 import { rebuildSortedRoots } from './rootSorter'
 import { shouldRun, resetJobTiming } from './rateLimiter'
 
@@ -41,6 +44,17 @@ function cancelFrame(handle: number): void {
   if (typeof cancelAnimationFrame === 'function') cancelAnimationFrame(handle)
   else clearTimeout(handle as unknown as ReturnType<typeof setTimeout>)
 }
+
+//* Fixed Timestep ==============================
+// @see docs/superpowers/specs/2026-09-26-fixed-timestep-design.md
+
+/**
+ * Slack when counting whole substeps in a clock's accumulator, in seconds. Lets
+ * a driver whose interval equals the timestep up to float rounding (60Hz and
+ * `1/60`) fire exactly one substep per frame instead of 0-2-1-0-2. It never
+ * changes how much time is subtracted, so it cannot drift the simulation clock.
+ */
+const TIMESTEP_EPSILON = 1e-9
 
 /**
  * Global Singleton Scheduler - manages the frame loop and job execution for ALL roots.
@@ -235,7 +249,7 @@ export class Scheduler {
       getState: options.getState ?? (() => ({})),
       onError: options.onError,
       jobs: new Map(),
-      sortedJobs: [],
+      sortedBuckets: [],
       needsRebuild: false,
       frameloop: options.frameloop ?? this._frameloop,
       pendingFrames: 0,
@@ -246,6 +260,7 @@ export class Scheduler {
       lastTickTime: null,
       accumulatedTime: 0,
       maxDelta: options.maxDelta,
+      clocks: new Map(),
     }
 
     // Job errors dispatch to the owning root's handler (above). The scheduler-wide
@@ -311,6 +326,7 @@ export class Scheduler {
       // animation that had been running standalone.
       hostRoot.lastTickTime = ambient.lastTickTime
       hostRoot.accumulatedTime = ambient.accumulatedTime
+      hostRoot.clocks = ambient.clocks
     }
 
     // Clear ambient's jobs BEFORE unregister so its teardown doesn't delete the
@@ -454,6 +470,51 @@ export class Scheduler {
   }
 
   /**
+   * Give a phase a fixed timestep, change it, or clear it with `undefined` so it
+   * runs once per frame again. `physics` is fixed at `1 / 60` by default.
+   *
+   * A changed timestep resets that phase's clock on every root: banked time
+   * measured in the old step would burst under a smaller one.
+   * @param {string} name - The phase to update
+   * @param {number | undefined} timestep - Seconds per substep, or undefined for per-frame
+   * @param {PhaseTimestepOptions} [options] - `maxSubsteps` cap
+   * @returns {void}
+   * @example
+   * scheduler.setPhaseTimestep('physics', 1 / 120)
+   * scheduler.setPhaseTimestep('physics', undefined) // back to per-frame
+   */
+  setPhaseTimestep(name: string, timestep: number | undefined, options?: PhaseTimestepOptions): void {
+    const changed = this.phaseGraph.setPhaseTimestep(name, timestep, options?.maxSubsteps)
+    if (!changed) return
+    for (const root of this.roots.values()) root.clocks.delete(name)
+  }
+
+  /**
+   * Read a phase's fixed timestep in seconds, or undefined for a per-frame phase.
+   * @param {string} name - The phase to inspect
+   * @returns {number | undefined} The timestep
+   */
+  getPhaseTimestep(name: string): number | undefined {
+    return this.phaseGraph.getPhase(name)?.timestep
+  }
+
+  /**
+   * The overstep of one fixed phase on one root: the fraction of its next
+   * substep already banked, in [0, 1). Frame callbacks get the first fixed
+   * phase's value as `state.overstep`; this is the general form for a second
+   * fixed phase or for reading from outside a callback.
+   * @param {string} [phase] - Fixed phase; defaults to the first in execution order
+   * @param {string} [rootId] - Root; defaults to the first registered root
+   * @returns {number} Overstep in [0, 1), or 0 when unknown
+   */
+  getOverstep(phase?: string, rootId?: string): number {
+    const root = rootId ? this.roots.get(rootId) : this.roots.values().next().value
+    const name = phase ?? this.phaseGraph.getFixedPhases()[0]?.name
+    if (!root || !name) return 0
+    return root.clocks.get(name)?.overstep ?? 0
+  }
+
+  /**
    * Check if a phase exists in the scheduler.
    * @param {string} name - The phase name to check
    * @returns {boolean} True if the phase exists
@@ -588,6 +649,7 @@ export class Scheduler {
       enabled: options.enabled ?? true,
       system: options.system ?? false,
     }
+    this.warnIfThrottledInFixedPhase(job)
 
     // Handle duplicate IDs (last wins)
     if (root.jobs.has(id)) {
@@ -702,6 +764,7 @@ export class Scheduler {
       needsRebuild = true
     }
 
+    if ('fps' in options || 'phase' in options) this.warnIfThrottledInFixedPhase(job)
     if (needsRebuild) root.needsRebuild = true
   }
 
@@ -998,6 +1061,7 @@ export class Scheduler {
     for (const root of this.roots.values()) {
       root.lastTickTime = null
       root.accumulatedTime = 0
+      root.clocks.clear()
     }
   }
 
@@ -1066,16 +1130,20 @@ export class Scheduler {
     const now = timestamp ?? performance.now()
     const driverDelta = this.loopState.lastTime !== null ? (now - this.loopState.lastTime) / 1000 : 0
     // Reported, not committed: stepping one job in isolation must not advance the
-    // root's frame clock and shrink the delta its next real frame receives.
-    const delta = this.computeRootDelta(root, now, driverDelta)
+    // root's frame clock and shrink the delta its next real frame receives. In a
+    // fixed phase the job gets exactly one substep and the clock is untouched.
+    const timestep = this.phaseGraph.getPhase(job.phase)?.timestep
+    const clock = timestep !== undefined ? root.clocks.get(job.phase) : undefined
+    const delta = timestep ?? this.computeRootDelta(root, now, driverDelta)
     const providedState = root.getState?.() ?? {}
 
     const frameState = {
       ...providedState,
       time: now,
       delta,
-      elapsed: root.accumulatedTime,
+      elapsed: timestep !== undefined ? (clock?.substeps ?? 0) * timestep : root.accumulatedTime,
       frame: this.loopState.frameCount,
+      overstep: this.getOverstep(undefined, root.id),
     } as FrameNextState
 
     try {
@@ -1208,13 +1276,19 @@ export class Scheduler {
   private tickRoot(root: RootEntry, timestamp: number, driverDelta: number): void {
     // Rebuild if needed
     if (root.needsRebuild) {
-      root.sortedJobs = rebuildSortedJobs(root.jobs, this.phaseGraph)
+      root.sortedBuckets = rebuildPhaseBuckets(root.jobs, this.phaseGraph)
       root.needsRebuild = false
     }
 
     const delta = this.computeRootDelta(root, timestamp, driverDelta)
     root.lastTickTime = timestamp
     root.accumulatedTime += delta
+
+    // Advance every fixed clock before any job runs, so a job in any phase reads
+    // this frame's overstep, not last frame's.
+    const fixedPhases = this.phaseGraph.getFixedPhases()
+    for (const phase of fixedPhases) this.advanceClock(root, phase.name, phase.timestep!, phase.maxSubsteps, delta)
+    const overstep = fixedPhases.length > 0 ? root.clocks.get(fixedPhases[0].name)!.overstep : 0
 
     const providedState = root.getState?.() ?? {}
 
@@ -1226,35 +1300,128 @@ export class Scheduler {
       delta,
       elapsed: root.accumulatedTime,
       frame: this.loopState.frameCount,
+      overstep,
     } as FrameNextState
 
-    // Dispatch jobs
-    for (const job of root.sortedJobs) {
-      if (!shouldRun(job, timestamp)) continue
-
-      let jobDelta = delta
-      let jobState = frameState
-
-      if (job.fps) {
-        // A throttled job skips frames, so the root delta understates how much
-        // time passed for it — an fps:30 job in a 60fps root would be told 16ms
-        // every 33ms and run at half speed. Differencing the root's accumulated
-        // time gives the real interval, and inherits the root's sleep cap for
-        // free. Only throttled jobs need this: an unthrottled job runs on every
-        // root tick, so its interval IS the root delta — and differencing it
-        // would reintroduce float rounding, making `jobDelta !== delta` on most
-        // frames and forcing a fresh state copy per job per frame.
-        if (job.lastRunElapsed !== undefined) jobDelta = root.accumulatedTime - job.lastRunElapsed
-        job.lastRunElapsed = root.accumulatedTime
-        if (jobDelta !== delta) jobState = { ...frameState, delta: jobDelta } as FrameNextState
+    // Dispatch phase by phase: a fixed phase repeats as a unit, in job order
+    for (const bucket of root.sortedBuckets) {
+      const timestep = this.phaseGraph.getPhase(bucket.phase)?.timestep
+      if (timestep !== undefined) {
+        this.runFixedBucket(root, bucket, timestep, frameState)
+        continue
       }
 
-      try {
-        job.callback(jobState, jobDelta)
-      } catch (error) {
-        this.reportJobError(root, job.id, error)
+      for (const job of bucket.jobs) {
+        if (!shouldRun(job, timestamp)) continue
+
+        let jobDelta = delta
+        let jobState = frameState
+
+        if (job.fps) {
+          // A throttled job skips frames, so the root delta understates how much
+          // time passed for it — an fps:30 job in a 60fps root would be told 16ms
+          // every 33ms and run at half speed. Differencing the root's accumulated
+          // time gives the real interval, and inherits the root's sleep cap for
+          // free. Only throttled jobs need this: an unthrottled job runs on every
+          // root tick, so its interval IS the root delta — and differencing it
+          // would reintroduce float rounding, making `jobDelta !== delta` on most
+          // frames and forcing a fresh state copy per job per frame.
+          if (job.lastRunElapsed !== undefined) jobDelta = root.accumulatedTime - job.lastRunElapsed
+          job.lastRunElapsed = root.accumulatedTime
+          if (jobDelta !== delta) jobState = { ...frameState, delta: jobDelta } as FrameNextState
+        }
+
+        try {
+          job.callback(jobState, jobDelta)
+        } catch (error) {
+          this.reportJobError(root, job.id, error)
+        }
       }
     }
+  }
+
+  /**
+   * Bank this frame's delta into one fixed clock and decide how many substeps
+   * it owes. Surplus beyond `maxSubsteps` is dropped (keeping the sub-step
+   * fraction) so a stall costs one slow frame, not a spiral of longer ones.
+   * @see docs/superpowers/specs/2026-09-26-fixed-timestep-design.md
+   * @param {RootEntry} root - The root whose clock advances
+   * @param {string} phase - The fixed phase
+   * @param {number} timestep - Seconds per substep
+   * @param {number} maxSubsteps - Cap on substeps this frame
+   * @param {number} delta - The root delta for this tick, in seconds
+   * @returns {void}
+   * @private
+   */
+  private advanceClock(root: RootEntry, phase: string, timestep: number, maxSubsteps: number, delta: number): void {
+    let clock = root.clocks.get(phase)
+    if (!clock) {
+      clock = { accumulator: 0, substeps: 0, pending: 0, overstep: 0 }
+      root.clocks.set(phase, clock)
+    }
+
+    clock.accumulator += delta
+    let pending = Math.floor((clock.accumulator + TIMESTEP_EPSILON) / timestep)
+    if (pending < 0) pending = 0
+
+    const overflow = pending > maxSubsteps
+    if (overflow) pending = maxSubsteps
+    clock.accumulator -= pending * timestep
+    if (overflow && clock.accumulator >= timestep) clock.accumulator %= timestep
+
+    clock.pending = pending
+    clock.overstep = Math.min(0.999999, Math.max(0, clock.accumulator / timestep))
+  }
+
+  /**
+   * Run one fixed phase for this tick: the whole bucket once per owed substep,
+   * in job order, each job told `delta === timestep` and the phase's simulated
+   * time as `elapsed`. Dependent jobs interleave per substep (A B, A B), the
+   * way engine FixedUpdate schedules do.
+   * @param {RootEntry} root - The owning root, for its clock and error dispatch
+   * @param {PhaseBucket} bucket - The phase's jobs in order
+   * @param {number} timestep - Seconds per substep
+   * @param {FrameNextState} frameState - The root's frame state for this tick
+   * @returns {void}
+   * @private
+   */
+  private runFixedBucket(root: RootEntry, bucket: PhaseBucket, timestep: number, frameState: FrameNextState): void {
+    const clock = root.clocks.get(bucket.phase)
+    if (!clock || clock.pending === 0) return
+
+    // One state object for every substep; only `elapsed` moves between them.
+    const substepState = { ...frameState, delta: timestep } as FrameNextState
+
+    for (let i = 0; i < clock.pending; i++) {
+      clock.substeps++
+      substepState.elapsed = clock.substeps * timestep
+
+      for (const job of bucket.jobs) {
+        // fps has no meaning inside a fixed clock (warned at registration); only
+        // `enabled` gates a substep.
+        if (!job.enabled) continue
+        try {
+          job.callback(substepState, timestep)
+        } catch (error) {
+          this.reportJobError(root, job.id, error)
+        }
+      }
+    }
+  }
+
+  /**
+   * `fps` throttles by wall clock, which has no coherent meaning inside a fixed
+   * clock; a job placed in a fixed phase with `fps` set is warned and runs every
+   * substep.
+   * @param {Job} job - The job to check
+   * @returns {void}
+   * @private
+   */
+  private warnIfThrottledInFixedPhase(job: Job): void {
+    if (job.fps === undefined || this.phaseGraph.getPhase(job.phase)?.timestep === undefined) return
+    console.warn(
+      `[Scheduler] Job "${job.id}": fps is ignored in the fixed phase "${job.phase}"; it runs every substep.`,
+    )
   }
 
   /**

@@ -44,7 +44,7 @@ Jobs are organized into **phases** — named stages that run in sequence:
 Frame Budget (~16.7ms)
 ├─ start phase    - Early setup, frame initialization
 ├─ input phase    - Input processing, event handling
-├─ physics phase  - Physics simulation
+├─ physics phase  - Physics simulation (fixed timestep, 1/60)
 ├─ update phase   - Game logic, animations (default)
 ├─ render phase   - Custom rendering, effects
 └─ finish phase   - Cleanup, stats, telemetry
@@ -61,8 +61,8 @@ const scheduler = getScheduler()
 // Input handling runs first
 scheduler.register(processInput, { phase: 'input' })
 
-// Physics after input
-scheduler.register(() => world.step(1 / 60), { phase: 'physics' })
+// Physics after input — a fixed phase, so dt is exactly 1/60 every call
+scheduler.register((state, dt) => world.step(dt), { phase: 'physics' })
 
 // Game logic after physics (default phase)
 scheduler.register(updateGameState, { phase: 'update' })
@@ -77,7 +77,7 @@ The same thing in React:
 import { useFrame } from '@pmndrs/scheduler/react'
 
 useFrame(processInput, { phase: 'input' })
-useFrame(() => world.step(1 / 60), { phase: 'physics' })
+useFrame((state, dt) => world.step(dt), { phase: 'physics' })
 useFrame(updateGameState, { phase: 'update' })
 useFrame(recordStats, { phase: 'finish' })
 ```
@@ -239,10 +239,9 @@ of frames, the two modes differ:
   scheduler.register(physicsStep, { fps: 60, drop: false })
   ```
 
-Either way a job runs at most **once per frame**, and its `delta` is the real time since it
-last ran — not a fixed `1 / fps`. A fixed-timestep simulation that must advance by exactly
-`1 / fps` per call (running several steps in a slow frame) still needs its own accumulator
-inside the callback.
+Either way a throttled job runs at most **once per frame**, and its `delta` is the real time
+since it last ran — not a fixed `1 / fps`. For a simulation that needs a constant step, put
+it in a [fixed phase](#fixed-timestep-the-physics-phase) — `physics` already is one.
 
 On high-refresh displays (120Hz, 144Hz) your every-frame work runs faster while throttled
 jobs stay capped.
@@ -261,6 +260,89 @@ scheduler.register((state, delta) => (y += delta * 100), { fps: 30 })
 
 The delta is measured against the owning root's clock, so it also excludes any time the
 root spent asleep — a throttled job in a demand canvas can't jump on wake either.
+
+### Fixed timestep: the `physics` phase
+
+Integrators want the **same** `delta` every call, and they want to stay on the clock when a
+frame runs long. Rigid bodies, cloth, springs with stiff constants — all of them go unstable
+or drift if `delta` wobbles with the frame rate. So the `physics` phase is a **fixed phase**
+out of the box, at `1 / 60`:
+
+```ts
+scheduler.register(
+  (state, dt) => {
+    previous.copy(current)
+    world.step(dt) // dt is exactly 1/60 on every call, on any display
+  },
+  { phase: 'physics' },
+)
+```
+
+Each frame the scheduler banks the root's time into the phase's clock and runs the whole
+phase once per whole timestep: once on a 60Hz display, twice in a 30Hz frame, zero or two
+times on a 144Hz display, six times in a 100ms hitch. Time is conserved — after any span,
+`substeps × timestep` equals the time the root saw minus a remainder smaller than one
+timestep — so the simulation never drifts from wall time.
+
+Two things follow from the clock belonging to the **phase** rather than to each job:
+
+- Several jobs in `physics` interleave per substep, in job order: `A B, A B, A B`, never
+  `A A A, B B B`. A controller that reads what the integrator wrote sees every step.
+- Inside the phase, `state.elapsed` is the phase's simulated time (`substeps × timestep`)
+  and advances per substep. Everywhere else it's the root's running time. `state.time` and
+  `state.frame` stay the driver's values in both.
+
+#### Rendering between substeps: `overstep`
+
+A timestep rarely lines up with a frame (`1/60` on 144Hz, or after a hitch), so a frame is
+usually drawn some fraction of the way between two simulation states. That fraction is
+`state.overstep`, in `[0, 1)`, available to every job in the root and computed before any of
+them runs. Interpolate with it in the render phase and the 2-3-2-3 substep cadence stops
+reading as judder:
+
+```ts
+scheduler.register(
+  (state) => {
+    mesh.position.lerpVectors(previous.position, current.position, state.overstep)
+  },
+  { phase: 'render' },
+)
+```
+
+(In Fiedler's "Fix Your Timestep" this is `alpha`; it's called `overstep` here because
+`alpha` already means opacity in a renderer.)
+
+#### Changing the rate, and stalls
+
+```ts
+scheduler.setPhaseTimestep('physics', 1 / 120) // stiffer sim
+scheduler.setPhaseTimestep('physics', 1 / 60, { maxSubsteps: 4 }) // tighter budget
+scheduler.setPhaseTimestep('physics', undefined) // per-frame again
+scheduler.getPhaseTimestep('physics') // 1/60 by default
+```
+
+A stall is bounded by `maxSubsteps` (default 8 per frame). Beyond it the surplus is dropped
+rather than carried, so one slow frame can't spiral into ever-slower frames; the simulation
+runs slow for that frame and is back on the clock the next. Changing the timestep resets
+the clock, since banked time measured in the old step would burst under a smaller one.
+
+#### Another fixed phase
+
+Any phase can own a clock. Add one when a second simulation needs its own rate:
+
+```ts
+scheduler.addPhase('cloth', { after: 'physics', timestep: 1 / 30, maxSubsteps: 2 })
+scheduler.register(simulateCloth, { phase: 'cloth' })
+```
+
+`state.overstep` reports the first fixed phase in execution order (`physics`, unless you
+reordered); `scheduler.getOverstep('cloth')` reads a second one. Ordering slots around a
+fixed phase (`before: 'physics'`, `after: 'physics'`) run once per frame, outside its clock.
+
+Other rules: `fps` has no meaning inside a fixed phase and is ignored with a warning;
+`pause()` just skips substeps and `resume()` rejoins the next one with no burst; a waking
+demand root feeds in at most one capped frame; `stepJob()` runs exactly one substep. Design
+notes: [fixed-timestep spec](./superpowers/specs/2026-09-26-fixed-timestep-design.md).
 
 ## Root ordering
 
@@ -372,8 +454,8 @@ scheduler.addPhase('ai', { after: 'physics', before: 'update' })
 
 scheduler.register(processInput, { phase: 'input', id: 'input-handler' })
 
-// Physics at 60fps, catching up if behind
-scheduler.register(() => physicsWorld.step(1 / 60), { phase: 'physics', fps: 60, drop: false })
+// Physics: the phase is fixed at 1/60, so dt is constant and slow frames catch up
+scheduler.register((state, dt) => physicsWorld.step(dt), { phase: 'physics' })
 
 // AI at 20fps, dropping if behind
 scheduler.register(aiSystemUpdate, { phase: 'ai', fps: 20, drop: true })
