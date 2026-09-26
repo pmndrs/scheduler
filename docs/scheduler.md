@@ -43,7 +43,12 @@ const scheduler = getScheduler()
 ```
 
 The instance is shared across bundles via `Symbol.for('@pmndrs/scheduler')`, so mixing
-imports (e.g. your app + react-three-fiber) always resolves to the **same** scheduler.
+imports (e.g. your app + react-three-fiber) always resolves to the **same** scheduler. The
+same global key keeps it alive across hot module reloads.
+
+The loop is driven by `requestAnimationFrame`. In a realm without one (Node, some workers)
+it falls back to a ~60Hz `setTimeout` so registering a job never throws; for deterministic
+headless use prefer `frameloop = 'never'` and [`step()`](#steptimestamp).
 
 In React you can also reach it through the hook:
 
@@ -180,6 +185,9 @@ scheduler.registerRoot('standalone')
 
 - `getState` is how a host injects its own state (r3f injects its `RootState`). Whatever it
   returns is spread into the object passed to every job callback, alongside timing.
+- `onError` is per root: an error thrown by one of this root's jobs goes to this handler,
+  never to another root's. A root without one falls back to the most recently registered
+  handler, then to `console.error`. That same fallback backs `triggerError()`.
 - Roots share one RAF driver and its `time` / `frame`, but their mode, pending demand
   frames, `delta`, and `elapsed` are independent — a sleeping root doesn't accumulate time
   it never saw. `maxDelta` caps how far a root catches up after skipping frames; the default
@@ -326,8 +334,13 @@ scheduler.register<GameState>(
 
 Notes:
 
-- Duplicate ids replace the existing job (with a warning).
+- Duplicate ids replace the existing job (with a warning). Reusing an id on a _second_ root
+  also warns: id-based calls (`updateJob`, `pauseJob`, `getJobRootId`) resolve to the most
+  recent registration.
 - If `before`/`after` is set without an explicit `phase`, a phase is auto-resolved.
+- The returned unsubscribe removes exactly the job it registered, wherever it lives by then
+  (a host may have adopted it), and is a no-op if a later registration replaced it.
+- A throttled (`fps`) job always runs on its first frame, then waits its interval.
 
 ### `unregister(id, rootId?)`
 
@@ -337,8 +350,13 @@ scheduler.unregister('my-job')
 
 ### `updateJob(id, options)`
 
-Update a job's options. `priority`, `fps`, `drop`, and `enabled` change in place; `phase`,
-`before`, and `after` trigger a re-sort.
+Update a job's options. Changing `priority`, `enabled`, `phase`, `before`, or `after`
+re-sorts the root; `fps` and `drop` change in place.
+
+A key that is **present** with the value `undefined` resets that field to its default
+(`{ fps: undefined }` removes the throttle, `{ phase: undefined }` re-derives the phase
+from `before`/`after` or falls back to `update`). A key that is absent leaves the field
+alone.
 
 ```ts
 scheduler.updateJob('my-job', { priority: 5 })

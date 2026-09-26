@@ -202,6 +202,12 @@ Tier 3 matters if you reference a job that hasn't registered yet, or one in a **
 root**: job dependencies only resolve within a single root. Order whole roots with
 [root constraints](./scheduler.md#setrootconstraintsrootid-constraints) instead.
 
+A job with an **explicit** `phase` keeps it even when a `before`/`after` target lives in
+another phase. If phase order already satisfies the constraint (`{ phase: 'render', after:
+'camera' }` with `camera` in `update`) nothing happens; if it contradicts it (`{ phase:
+'update', after: 'camera' }` with `camera` in `render`) the scheduler warns once and the
+explicit phase wins. Move the job or drop the constraint to clear the warning.
+
 ## FPS throttling and frame budget management
 
 Not all work needs 60fps. Expensive operations can run slower without hurting perceived
@@ -215,17 +221,28 @@ scheduler.register(smoothAnimation) // every frame
 
 ### Drop vs catch-up
 
-When a throttled job misses its window, you choose how it recovers:
+A throttled job can only run on a driver frame, so `fps` is a **ceiling**: the job runs on
+the first frame at which its interval has elapsed. When that interval isn't a whole number
+of frames, the two modes differ:
 
-- **Drop (`drop: true`, default)** — skip the missed frames. Good for visual/UI updates.
+- **Drop (`drop: true`, default)** — measure from the frame it actually ran on. The
+  effective rate rounds down to a whole frame multiple (`fps: 24` on a 60Hz display runs
+  every third frame, at 20fps). Good for visual/UI updates, where a steady cadence matters
+  more than the exact rate.
   ```ts
   scheduler.register(updateUI, { fps: 30, drop: true })
   ```
-- **Catch-up (`drop: false`)** — advance timing to make up missed steps. Good for physics
-  and simulations that need consistent timing.
+- **Catch-up (`drop: false`)** — measure from when the job was _due_. Run frames alternate
+  between two and three frames apart, but the average rate matches `fps` (24fps on 60Hz runs
+  50ms/33ms/50ms…). Good when the average rate must hold.
   ```ts
   scheduler.register(physicsStep, { fps: 60, drop: false })
   ```
+
+Either way a job runs at most **once per frame**, and its `delta` is the real time since it
+last ran — not a fixed `1 / fps`. A fixed-timestep simulation that must advance by exactly
+`1 / fps` per call (running several steps in a slow frame) still needs its own accumulator
+inside the callback.
 
 On high-refresh displays (120Hz, 144Hz) your every-frame work runs faster while throttled
 jobs stay capped.
