@@ -354,3 +354,157 @@ describe('useFrame audit regressions', () => {
     expect(scheduler.getJobCount()).toBe(0)
   })
 })
+
+describe('useFrame stable jobs', () => {
+  it('keeps its ordering slot and id when options change', () => {
+    const scheduler = Scheduler.get()
+    const order: string[] = []
+    let capturedId = ''
+
+    function First({ fps }: { fps?: number }) {
+      const controls = useFrame(() => order.push('first'), { fps })
+      capturedId = controls.id
+      return null
+    }
+    function Second() {
+      useFrame(() => order.push('second'))
+      return null
+    }
+
+    let view: ReturnType<typeof render>
+    act(() => {
+      view = render(
+        <>
+          <First />
+          <Second />
+        </>,
+      )
+    })
+    const idBefore = capturedId
+    act(() => scheduler.step(1000))
+    expect(order).toEqual(['first', 'second'])
+
+    // Re-registering used to move `first` behind `second` (new insertion index).
+    order.length = 0
+    act(() => {
+      view.rerender(
+        <>
+          <First fps={120} />
+          <Second />
+        </>,
+      )
+    })
+    act(() => scheduler.step(2000))
+    expect(order).toEqual(['first', 'second'])
+    expect(capturedId).toBe(idBefore)
+    expect(scheduler.getJobCount()).toBe(2)
+  })
+
+  it('does not undo an imperative pause() when an unrelated option changes', () => {
+    const scheduler = Scheduler.get()
+    const cb = vi.fn()
+    let controls: any
+
+    function Runner({ priority }: { priority: number }) {
+      controls = useFrame(cb, { priority })
+      return null
+    }
+
+    let view: ReturnType<typeof render>
+    act(() => {
+      view = render(<Runner priority={0} />)
+    })
+    act(() => controls.pause())
+    expect(controls.isPaused).toBe(true)
+
+    act(() => {
+      view.rerender(<Runner priority={5} />)
+    })
+    expect(controls.isPaused).toBe(true)
+    act(() => scheduler.step(1000))
+    expect(cb).not.toHaveBeenCalled()
+  })
+
+  it('keeps isPaused reactive after an option change', () => {
+    const states: boolean[] = []
+    let controls: any
+
+    function Runner({ fps }: { fps?: number }) {
+      controls = useFrame(() => {}, { fps })
+      states.push(controls.isPaused)
+      return null
+    }
+
+    let view: ReturnType<typeof render>
+    act(() => {
+      view = render(<Runner />)
+    })
+    act(() => {
+      view.rerender(<Runner fps={30} />)
+    })
+    act(() => controls.pause())
+    expect(states.at(-1)).toBe(true)
+    act(() => controls.resume())
+    expect(states.at(-1)).toBe(false)
+  })
+
+  it('removing an option resets it to the default', () => {
+    const scheduler = Scheduler.get()
+    const cb = vi.fn()
+
+    function Runner({ enabled }: { enabled?: boolean }) {
+      useFrame(cb, { enabled })
+      return null
+    }
+
+    let view: ReturnType<typeof render>
+    act(() => {
+      view = render(<Runner enabled={false} />)
+    })
+    act(() => scheduler.step(1000))
+    expect(cb).not.toHaveBeenCalled()
+
+    act(() => {
+      view.rerender(<Runner />) // enabled omitted → default true
+    })
+    act(() => scheduler.step(2000))
+    expect(cb).toHaveBeenCalledTimes(1)
+  })
+
+  it('re-registers when the explicit id changes', () => {
+    const scheduler = Scheduler.get()
+
+    function Runner({ id }: { id: string }) {
+      useFrame(() => {}, { id })
+      return null
+    }
+
+    let view: ReturnType<typeof render>
+    act(() => {
+      view = render(<Runner id="one" />)
+    })
+    expect(scheduler.getJobIds()).toEqual(['one'])
+    act(() => {
+      view.rerender(<Runner id="two" />)
+    })
+    expect(scheduler.getJobIds()).toEqual(['two'])
+  })
+
+  it('gives components in separate React roots distinct auto ids', () => {
+    const scheduler = Scheduler.get()
+
+    function Runner() {
+      useFrame(() => {})
+      return null
+    }
+
+    act(() => {
+      render(<Runner />)
+      render(<Runner />) // a second React root with an identical tree
+    })
+
+    const ids = scheduler.getJobIds()
+    expect(ids).toHaveLength(2)
+    expect(new Set(ids).size).toBe(2)
+  })
+})

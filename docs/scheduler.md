@@ -350,8 +350,13 @@ scheduler.unregister('my-job')
 
 ### `updateJob(id, options)`
 
-Update a job's options. `priority`, `fps`, `drop`, and `enabled` change in place; `phase`,
-`before`, and `after` trigger a re-sort.
+Update a job's options. Changing `priority`, `enabled`, `phase`, `before`, or `after`
+re-sorts the root; `fps` and `drop` change in place.
+
+A key that is **present** with the value `undefined` resets that field to its default
+(`{ fps: undefined }` removes the throttle, `{ phase: undefined }` re-derives the phase
+from `before`/`after` or falls back to `update`). A key that is absent leaves the field
+alone.
 
 ```ts
 scheduler.updateJob('my-job', { priority: 5 })

@@ -2539,3 +2539,74 @@ describe('Scheduler cross-phase constraint warnings', () => {
     expect(warn).not.toHaveBeenCalled()
   })
 })
+
+//* updateJob semantics ==============================
+
+describe('Scheduler updateJob', () => {
+  beforeEach(() => {
+    Scheduler.reset()
+    Scheduler.get().frameloop = 'never'
+  })
+
+  afterEach(() => {
+    Scheduler.reset()
+  })
+
+  it('re-sorts when priority changes', () => {
+    const scheduler = Scheduler.get()
+    const order: string[] = []
+    scheduler.register(() => order.push('a'), { id: 'a', priority: 0 })
+    scheduler.register(() => order.push('b'), { id: 'b', priority: 0 })
+
+    scheduler.step(0)
+    expect(order).toEqual(['a', 'b'])
+
+    order.length = 0
+    scheduler.updateJob('b', { priority: 10 })
+    scheduler.step(16)
+    expect(order).toEqual(['b', 'a'])
+  })
+
+  it('clears a throttle when fps is present but undefined, and keeps it when absent', () => {
+    const scheduler = Scheduler.get()
+    const cb = vi.fn()
+    scheduler.register(cb, { id: 'j', fps: 10 })
+
+    scheduler.step(0)
+    scheduler.step(16)
+    expect(cb).toHaveBeenCalledTimes(1)
+
+    scheduler.updateJob('j', { priority: 1 }) // fps absent: still throttled
+    scheduler.step(32)
+    expect(cb).toHaveBeenCalledTimes(1)
+
+    scheduler.updateJob('j', { fps: undefined })
+    scheduler.step(48)
+    scheduler.step(64)
+    expect(cb).toHaveBeenCalledTimes(3)
+  })
+
+  it('re-derives the phase from constraints when phase is reset to undefined', () => {
+    const scheduler = Scheduler.get()
+    scheduler.register(() => {}, { id: 'j', phase: 'render' })
+
+    scheduler.updateJob('j', { phase: undefined, before: 'render' })
+    scheduler.step(0)
+    expect(scheduler.phases).toContain('before:render')
+
+    scheduler.updateJob('j', { phase: undefined, before: undefined })
+    // Back to the default phase with no constraints
+    scheduler.register(() => {}, { id: 'probe', phase: 'update' })
+    expect(scheduler.getJobRootId('j')).toBeDefined()
+  })
+
+  it('generateJobId() mints ids that never collide with auto-registered ones', () => {
+    const scheduler = Scheduler.get()
+    const minted = scheduler.generateJobId()
+    scheduler.register(() => {})
+    scheduler.register(() => {}, { id: minted })
+    const ids = scheduler.getJobIds()
+    expect(new Set(ids).size).toBe(ids.length)
+    expect(ids).toContain(minted)
+  })
+})

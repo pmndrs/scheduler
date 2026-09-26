@@ -69,9 +69,13 @@ export function useFrame<T = FrameTimingState>(
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [optionsKey])
 
-  // Generate stable ID if not provided
-  const reactId = React.useId()
-  const id = options.id ?? reactId
+  // Stable id for this component instance. Minted by the scheduler rather than
+  // React's useId: useId is only unique within one React root, so two canvases
+  // (two reconciler roots) can produce the same id for jobs that then collide
+  // in the scheduler's global id space. Job ids never reach markup, so nothing
+  // needs them to match between server and client.
+  const [autoId] = React.useState(() => scheduler.generateJobId())
+  const id = options.id ?? autoId
 
   // Memoize callback ref (always points to latest callback)
   const callbackRef = useMutableCallback(callback)
@@ -80,7 +84,15 @@ export function useFrame<T = FrameTimingState>(
   // re-registering, but going from no callback to one (or back) must.
   const hasCallback = !!callback
 
-  // Subscribe on mount, unsubscribe on unmount (only if callback provided)
+  // The options the registered job currently reflects. Lets the update effect
+  // send only what changed, so an imperative pause() isn't undone by an
+  // unrelated option changing, and a mount doesn't issue a redundant update.
+  const appliedOptionsRef = React.useRef<UseFrameOptions | null>(null)
+
+  // Register once per id. Option changes are applied in place below rather than
+  // by re-registering: re-registering handed the job a new insertion index (its
+  // tie-break among equal priorities), reset its throttle timing, and dropped
+  // the isPaused subscription.
   useIsomorphicLayoutEffect(() => {
     // Skip registration if no callback - user just wants scheduler access
     if (!hasCallback) return
@@ -90,13 +102,28 @@ export function useFrame<T = FrameTimingState>(
     // exists). If this effect runs before a host's — React fires child effects
     // before parent — the host adopts this job when it registers. No waiting.
     // @see docs/design/ambient-root.md
-    return scheduler.register((state, delta) => callbackRef.current?.(state as T & FrameTimingState, delta), {
-      id,
-      ...options,
-    })
-    // Note: `callback` intentionally excluded - useMutableCallback handles updates
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [scheduler, id, optionsKey, hasCallback])
+    appliedOptionsRef.current = options
+    const unregister = scheduler.register(
+      (state, delta) => callbackRef.current?.(state as T & FrameTimingState, delta),
+      { id, ...options },
+    )
+    return () => {
+      appliedOptionsRef.current = null
+      unregister()
+    }
+    // `options` is read on (re)registration only; changes are applied in place below.
+  }, [scheduler, id, hasCallback])
+
+  // Apply option changes to the live job.
+  useIsomorphicLayoutEffect(() => {
+    if (!hasCallback) return
+    const previous = appliedOptionsRef.current
+    if (previous === null || previous === options) return // just registered with these
+
+    appliedOptionsRef.current = options
+    const patch = diffOptions(previous, options)
+    if (patch) scheduler.updateJob(id, patch)
+  }, [scheduler, id, hasCallback, optionsKey])
 
   // Reactive isPaused via useSyncExternalStore --------------------------------
   const isPaused = React.useSyncExternalStore(
@@ -151,4 +178,25 @@ export function useFrame<T = FrameTimingState>(
   }, [id, isPaused])
 
   return controls
+}
+
+//* Option diffing ==============================
+
+const UPDATABLE_KEYS = ['phase', 'before', 'after', 'priority', 'fps', 'drop', 'enabled'] as const
+
+/**
+ * The keys whose values differ between two option objects, as a patch for
+ * `updateJob`. A key that was removed is included as `undefined`, which
+ * `updateJob` reads as "back to the default" (it keys on presence).
+ * @returns The patch, or null when nothing changed
+ */
+function diffOptions(previous: UseFrameOptions, next: UseFrameOptions): Partial<UseFrameOptions> | null {
+  let patch: Partial<UseFrameOptions> | null = null
+  for (const key of UPDATABLE_KEYS) {
+    // before/after may be arrays; compare by value.
+    if (JSON.stringify(previous[key]) === JSON.stringify(next[key])) continue
+    patch ??= {}
+    ;(patch as Record<string, unknown>)[key] = next[key]
+  }
+  return patch
 }

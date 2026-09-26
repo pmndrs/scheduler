@@ -14,7 +14,7 @@ export type Frameloop = 'always' | 'demand' | 'never'
 
 /** Options for the `useFrame` hook / `scheduler.register` */
 export interface UseFrameOptions {
-  /** Optional stable id for the job. Auto-generated if not provided */
+  /** Optional stable id for the job. Auto-generated (unique across React roots) if not provided */
   id?: string
   /** Named phase to run in. Default: 'update' */
   phase?: string
@@ -176,6 +176,7 @@ export interface SchedulerApi {
     callback: FrameCallback<T>,
     options?: JobOptions & { rootId?: string; system?: boolean },
   ): () => void
+  generateJobId(): string
   updateJob(id: string, options: Partial<JobOptions>): void
   unregister(id: string, rootId?: string): void
   getJobCount(): number

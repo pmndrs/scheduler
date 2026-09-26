@@ -2,6 +2,9 @@
 
 //* Unreleased ===============================================================
 
+- `useFrame` applies option changes in place with `updateJob` instead of re-registering. The job keeps its id, ordering slot among equal priorities, throttle timing, pause state, and `isPaused` subscription across option changes; only changed fields are sent, so an imperative `pause()` isn't undone by an unrelated option change.
+- `useFrame` auto-generated ids now come from `scheduler.generateJobId()` (new public method) instead of React's `useId`, which is only unique within one React root and could collide across canvases.
+- `updateJob` keys on presence: `{ fps: undefined }` clears the throttle and `{ phase: undefined }` re-derives the phase, while absent keys are untouched. It also re-sorts on `priority` changes, which it previously missed.
 - A `before`/`after` constraint that the phase order makes impossible (`{ phase: 'update', after: 'camera' }` with `camera` in `render`) now warns once per job instead of being silently ignored. The explicit phase still wins.
 - `onError` is now per root: a job error dispatches to the handler of the root that owns the job. Previously the last-registered root's handler received every root's errors. Roots without a handler fall back to the scheduler-wide one, then `console.error`.
 - Fixed: the unsubscribe returned by `register()` / `useFrame` did nothing once a host had adopted the job from the ambient root, so unmounted `useFrame` callbacks kept running. It now removes exactly the job it registered, wherever it lives.

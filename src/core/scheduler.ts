@@ -126,6 +126,7 @@ export class Scheduler {
   private globalAfterJobs: Map<string, GlobalJob> = new Map()
   private idleCallbacks: Set<(timestamp: number) => void> = new Set()
   private nextJobIndex: number = 0
+  private nextGeneratedJobId: number = 0
   /**
    * Job id → owning root. Kept in step with every root's `jobs` map so lookups
    * by id (`updateJob`, `pauseJob`, `getJobRootId`, unsubscribe) are O(1) and
@@ -665,27 +666,43 @@ export class Scheduler {
 
     if (!job || !root) return
 
-    // Update mutable fields
-    if (options.priority !== undefined) job.priority = options.priority
-    if (options.fps !== undefined) job.fps = options.fps
-    if (options.drop !== undefined) job.drop = options.drop
+    // Key presence, not value, decides what changes: `{ fps: undefined }` clears
+    // the throttle, while a missing key leaves it alone. That lets a declarative
+    // caller (useFrame) reset a field to its default by passing undefined.
+    let needsRebuild = false
 
-    if (options.enabled !== undefined) {
-      const wasEnabled = job.enabled
-      job.enabled = options.enabled
-      if (!wasEnabled && job.enabled) resetJobTiming(job)
-      if (wasEnabled !== job.enabled) root.needsRebuild = true
+    if ('priority' in options) {
+      const priority = options.priority ?? 0
+      if (priority !== job.priority) {
+        job.priority = priority
+        needsRebuild = true // sort order depends on it
+      }
+    }
+    if ('fps' in options) job.fps = options.fps
+    if ('drop' in options) job.drop = options.drop ?? true
+
+    if ('enabled' in options) {
+      const enabled = options.enabled ?? true
+      if (enabled !== job.enabled) {
+        job.enabled = enabled
+        if (enabled) resetJobTiming(job)
+        needsRebuild = true
+      }
     }
 
-    // Phase changes require rebuild
-    if (options.phase !== undefined || options.before !== undefined || options.after !== undefined) {
-      if (options.phase) job.phase = options.phase
-      if (options.before !== undefined) job.before = this.normalizeConstraints(options.before)
-      if (options.after !== undefined) job.after = this.normalizeConstraints(options.after)
+    // Placement: phase, or constraints that may derive one
+    if ('phase' in options || 'before' in options || 'after' in options) {
+      if ('before' in options) job.before = this.normalizeConstraints(options.before)
+      if ('after' in options) job.after = this.normalizeConstraints(options.after)
+      if ('phase' in options) {
+        job.phase = options.phase ?? this.resolveConstraintPhase([...job.before], [...job.after])
+      }
       // New placement, new chance to contradict the phase order: report it again.
       job.constraintWarned = false
-      root.needsRebuild = true
+      needsRebuild = true
     }
+
+    if (needsRebuild) root.needsRebuild = true
   }
 
   //* Job State Management Methods ================================
@@ -1462,12 +1479,16 @@ export class Scheduler {
   }
 
   /**
-   * Generate a unique job ID.
+   * Generate a job id that is unique for the lifetime of this scheduler.
+   *
+   * Public so hosts can mint ids that are unique across React roots: React's
+   * `useId` is only unique within one root, so two canvases can hand two jobs
+   * the same id. Job ids never reach markup, so nothing needs them to match
+   * between server and client.
    * @returns {string} A unique job ID in the format 'job_N'
-   * @private
    */
-  private generateJobId(): string {
-    return `job_${this.nextJobIndex}`
+  generateJobId(): string {
+    return `job_${this.nextGeneratedJobId++}`
   }
 
   /**
