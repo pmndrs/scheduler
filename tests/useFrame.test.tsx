@@ -320,3 +320,37 @@ describe('useFrame root-scoped controls', () => {
     }
   })
 })
+
+describe('useFrame audit regressions', () => {
+  it('registers when a callback appears after mounting without one', () => {
+    const scheduler = Scheduler.get()
+    const calls = vi.fn()
+
+    function Runner({ active }: { active: boolean }) {
+      useFrame(active ? calls : undefined)
+      return null
+    }
+
+    let view: ReturnType<typeof render>
+    act(() => {
+      view = render(<Runner active={false} />)
+    })
+    expect(scheduler.getJobCount()).toBe(0)
+
+    // Presence used to be read once inside the effect, so this never registered.
+    act(() => {
+      view.rerender(<Runner active={true} />)
+    })
+    expect(scheduler.getJobCount()).toBe(1)
+
+    act(() => {
+      scheduler.step(1000)
+    })
+    expect(calls).toHaveBeenCalledTimes(1)
+
+    act(() => {
+      view.rerender(<Runner active={false} />)
+    })
+    expect(scheduler.getJobCount()).toBe(0)
+  })
+})

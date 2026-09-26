@@ -43,7 +43,12 @@ const scheduler = getScheduler()
 ```
 
 The instance is shared across bundles via `Symbol.for('@pmndrs/scheduler')`, so mixing
-imports (e.g. your app + react-three-fiber) always resolves to the **same** scheduler.
+imports (e.g. your app + react-three-fiber) always resolves to the **same** scheduler. The
+same global key keeps it alive across hot module reloads.
+
+The loop is driven by `requestAnimationFrame`. In a realm without one (Node, some workers)
+it falls back to a ~60Hz `setTimeout` so registering a job never throws; for deterministic
+headless use prefer `frameloop = 'never'` and [`step()`](#steptimestamp).
 
 In React you can also reach it through the hook:
 
@@ -326,8 +331,13 @@ scheduler.register<GameState>(
 
 Notes:
 
-- Duplicate ids replace the existing job (with a warning).
+- Duplicate ids replace the existing job (with a warning). Reusing an id on a _second_ root
+  also warns: id-based calls (`updateJob`, `pauseJob`, `getJobRootId`) resolve to the most
+  recent registration.
 - If `before`/`after` is set without an explicit `phase`, a phase is auto-resolved.
+- The returned unsubscribe removes exactly the job it registered, wherever it lives by then
+  (a host may have adopted it), and is a no-op if a later registration replaced it.
+- A throttled (`fps`) job always runs on its first frame, then waits its interval.
 
 ### `unregister(id, rootId?)`
 

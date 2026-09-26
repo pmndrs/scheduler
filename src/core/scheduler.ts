@@ -16,33 +16,31 @@ import type {
   RootEntry,
   GlobalJob,
   FrameLoopState,
-  HMRData,
 } from '../types'
 import { PhaseGraph } from './phaseGraph'
 import { rebuildSortedJobs } from './sorter'
 import { rebuildSortedRoots } from './rootSorter'
 import { shouldRun, resetJobTiming } from './rateLimiter'
 
-//* HMR Support ==============================
-// Preserve scheduler instance across hot module reloads
-// This prevents the render loop from stopping during development
-declare const import_meta_hot: HMRData | undefined
+//* Frame Driver ==============================
+// The shared loop is driven by requestAnimationFrame wherever one exists. In a
+// realm without it (Node, some worker contexts) fall back to a ~60Hz timer so
+// registering a job never throws — `frameloop: 'never'` plus `step()` remains
+// the deterministic path for tests and headless simulation.
+//
+// Resolved per call, not at import: a polyfill (or a test stub) installed after
+// this module loads must still be honored.
+const FALLBACK_INTERVAL_MS = 1000 / 60
 
-// Get HMR data for development hot reloading
-// - In production builds: unbuild transforms import.meta.hot to import_meta_hot
-// - In tests: Skip entirely (NODE_ENV === 'test')
-// - Uses indirect eval to avoid TypeScript parsing import.meta syntax
-const hmrData = (() => {
-  if (typeof process !== 'undefined' && process.env.NODE_ENV === 'test') return undefined
-  if (typeof import_meta_hot !== 'undefined') return import_meta_hot
-  // Indirect eval prevents TypeScript from parsing import.meta
+function requestFrame(callback: (timestamp: number) => void): number {
+  if (typeof requestAnimationFrame === 'function') return requestAnimationFrame(callback)
+  return setTimeout(() => callback(performance.now()), FALLBACK_INTERVAL_MS) as unknown as number
+}
 
-  try {
-    return (0, eval)('import.meta.hot') as HMRData | undefined
-  } catch {
-    return undefined
-  }
-})()
+function cancelFrame(handle: number): void {
+  if (typeof cancelAnimationFrame === 'function') cancelAnimationFrame(handle)
+  else clearTimeout(handle as unknown as ReturnType<typeof setTimeout>)
+}
 
 /**
  * Global Singleton Scheduler - manages the frame loop and job execution for ALL roots.
@@ -80,20 +78,15 @@ export class Scheduler {
 
   /**
    * Get the global scheduler instance (creates if doesn't exist).
-   * Uses HMR data to preserve instance across hot reloads.
+   *
+   * The instance lives on `globalThis` under a `Symbol.for` key, which is what
+   * also keeps it alive across hot module reloads: a re-evaluated module finds
+   * the existing instance instead of starting a second loop.
    * @returns {Scheduler} The singleton scheduler instance
    */
   static get(): Scheduler {
-    // Try to restore from HMR data first (prevents render loop stopping on HMR)
-    if (!Scheduler.instance && hmrData?.data?.scheduler) {
-      Scheduler.instance = hmrData.data.scheduler
-    }
     if (!Scheduler.instance) {
       Scheduler.instance = new Scheduler()
-      // Store in HMR data for persistence across reloads
-      if (hmrData?.data) {
-        hmrData.data.scheduler = Scheduler.instance
-      }
     }
     return Scheduler.instance
   }
@@ -107,10 +100,6 @@ export class Scheduler {
     if (Scheduler.instance) {
       Scheduler.instance.stop()
       Scheduler.instance = null
-    }
-    // Also clear from HMR data
-    if (hmrData?.data) {
-      hmrData.data.scheduler = null
     }
   }
 
@@ -135,9 +124,21 @@ export class Scheduler {
   private rootsNeedSort: boolean = true
   private globalBeforeJobs: Map<string, GlobalJob> = new Map()
   private globalAfterJobs: Map<string, GlobalJob> = new Map()
-  private nextGlobalIndex: number = 0
   private idleCallbacks: Set<(timestamp: number) => void> = new Set()
   private nextJobIndex: number = 0
+  /**
+   * Job id → owning root. Kept in step with every root's `jobs` map so lookups
+   * by id (`updateJob`, `pauseJob`, `getJobRootId`, unsubscribe) are O(1) and
+   * follow a job when ambient adoption moves it between roots.
+   */
+  private jobRoots: Map<string, RootEntry> = new Map()
+  /**
+   * Bumped on every driver (re)start. A RAF callback that is still running when
+   * the driver restarts underneath it — a job that calls stop() then start(), or
+   * unregisters the last root and registers a new one — must not schedule the
+   * next frame as well, or two loops end up alive and every job ticks twice.
+   */
+  private loopGeneration: number = 0
   private jobStateListeners: Map<string, Set<() => void>> = new Map()
   private _frameloop: Frameloop = 'always'
   private forceRunning: boolean = false
@@ -298,6 +299,7 @@ export class Scheduler {
         continue
       }
       hostRoot.jobs.set(jobId, job)
+      this.jobRoots.set(jobId, hostRoot)
     }
     if (ambient.jobs.size > 0) {
       hostRoot.needsRebuild = true
@@ -325,9 +327,10 @@ export class Scheduler {
     const root = this.roots.get(id)
     if (!root) return
 
-    // Clean up job state listeners for this root's jobs
+    // Clean up job state listeners and the id index for this root's jobs
     for (const jobId of root.jobs.keys()) {
       this.jobStateListeners.delete(jobId)
+      if (this.jobRoots.get(jobId) === root) this.jobRoots.delete(jobId)
     }
 
     this.roots.delete(id)
@@ -569,12 +572,23 @@ export class Scheduler {
     // Handle duplicate IDs (last wins)
     if (root.jobs.has(id)) {
       console.warn(`[useFrame] Job with id "${id}" already exists, replacing`)
+    } else if (this.jobRoots.has(id)) {
+      // Ids are looked up globally (updateJob, pauseJob, getJobRootId), so the
+      // same id on two roots makes every id-based call ambiguous.
+      console.warn(
+        `[Scheduler] Job id "${id}" is already registered on root "${this.jobRoots.get(id)!.id}"; ` +
+          `id-based lookups will resolve to the most recent registration.`,
+      )
     }
 
     root.jobs.set(id, job)
+    this.jobRoots.set(id, root)
     root.needsRebuild = true
 
-    return () => this.unregister(id, root.id)
+    // Remove this exact job, wherever it lives by then. The owning root can
+    // change after registration (ambient adoption), and the id can be reused by
+    // a later registration — so neither the root nor the id alone is a safe key.
+    return () => this.removeJob(job)
   }
 
   /**
@@ -587,10 +601,33 @@ export class Scheduler {
   unregister(id: string, rootId?: string): void {
     // Find the root containing this job
     const root = rootId ? this.roots.get(rootId) : this.findRootForJob(id)
+    const job = root?.jobs.get(id)
+    if (job) this.removeJob(job)
+  }
 
-    if (root?.jobs.delete(id)) {
-      root.needsRebuild = true
-      this.jobStateListeners.delete(id)
+  /**
+   * Remove one specific job object from whichever root currently holds it.
+   * A no-op if that root now holds a different job under the same id.
+   * @param {Job} job - The job to remove
+   * @returns {void}
+   * @private
+   */
+  private removeJob(job: Job): void {
+    const root = this.jobRoots.get(job.id)
+    if (!root || root.jobs.get(job.id) !== job) return
+
+    root.jobs.delete(job.id)
+    root.needsRebuild = true
+    this.jobStateListeners.delete(job.id)
+    this.jobRoots.delete(job.id)
+
+    // If another root still carries this id (a duplicate we warned about), keep
+    // it reachable by id.
+    for (const other of this.roots.values()) {
+      if (other.jobs.has(job.id)) {
+        this.jobRoots.set(job.id, other)
+        break
+      }
     }
   }
 
@@ -727,12 +764,12 @@ export class Scheduler {
     // No pause compensation needed either: elapsed time is accumulated per root
     // from the deltas it actually received, so a stopped span is excluded by
     // construction rather than subtracted after the fact.
+    this.loopGeneration++
     Object.assign(this.loopState, {
       running: true,
-      elapsedTime: this.loopState.elapsedTime ?? 0,
       lastTime: null,
       frameCount: 0,
-      rafHandle: requestAnimationFrame(this.loop),
+      rafHandle: requestFrame(this.loop),
     })
   }
 
@@ -763,7 +800,7 @@ export class Scheduler {
 
     this.loopState.running = false
     if (this.loopState.rafHandle !== null) {
-      cancelAnimationFrame(this.loopState.rafHandle)
+      cancelFrame(this.loopState.rafHandle)
       this.loopState.rafHandle = null
     }
   }
@@ -1022,9 +1059,13 @@ export class Scheduler {
    */
   private loop = (timestamp: number): void => {
     if (!this.loopState.running) return
+    const generation = this.loopGeneration
 
     this.executeFrame(timestamp, this.forceRunning ? 'all' : 'automatic')
-    if (!this.loopState.running) return
+    // A callback may have stopped the driver, or stopped and restarted it. In
+    // the latter case the restart already requested its own frame — this
+    // invocation belongs to the old loop and must not schedule another.
+    if (!this.loopState.running || generation !== this.loopGeneration) return
 
     if (!this.forceRunning && !this.hasAutomaticWork()) {
       this.notifyIdle(timestamp)
@@ -1033,7 +1074,7 @@ export class Scheduler {
     }
 
     // Schedule next frame
-    this.loopState.rafHandle = requestAnimationFrame(this.loop)
+    this.loopState.rafHandle = requestFrame(this.loop)
   }
 
   /**
@@ -1154,14 +1195,22 @@ export class Scheduler {
     for (const job of root.sortedJobs) {
       if (!shouldRun(job, timestamp)) continue
 
-      // A throttled job skips frames, so the root delta understates how much time
-      // passed for it — an fps:30 job in a 60fps root would be told 16ms every
-      // 33ms and run at half speed. Differencing the root's accumulated time gives
-      // the real interval, and inherits the root's sleep cap for free.
-      const jobDelta = job.lastRunElapsed === undefined ? delta : root.accumulatedTime - job.lastRunElapsed
-      job.lastRunElapsed = root.accumulatedTime
+      let jobDelta = delta
+      let jobState = frameState
 
-      const jobState = jobDelta === delta ? frameState : ({ ...frameState, delta: jobDelta } as FrameNextState)
+      if (job.fps) {
+        // A throttled job skips frames, so the root delta understates how much
+        // time passed for it — an fps:30 job in a 60fps root would be told 16ms
+        // every 33ms and run at half speed. Differencing the root's accumulated
+        // time gives the real interval, and inherits the root's sleep cap for
+        // free. Only throttled jobs need this: an unthrottled job runs on every
+        // root tick, so its interval IS the root delta — and differencing it
+        // would reintroduce float rounding, making `jobDelta !== delta` on most
+        // frames and forcing a fresh state copy per job per frame.
+        if (job.lastRunElapsed !== undefined) jobDelta = root.accumulatedTime - job.lastRunElapsed
+        job.lastRunElapsed = root.accumulatedTime
+        if (jobDelta !== delta) jobState = { ...frameState, delta: jobDelta } as FrameNextState
+      }
 
       try {
         job.callback(jobState, jobDelta)
@@ -1383,10 +1432,7 @@ export class Scheduler {
    * @private
    */
   private findRootForJob(jobId: string): RootEntry | undefined {
-    for (const root of this.roots.values()) {
-      if (root.jobs.has(jobId)) return root
-    }
-    return undefined
+    return this.jobRoots.get(jobId)
   }
 
   /**
@@ -1473,9 +1519,3 @@ export class Scheduler {
  * Creates one if it doesn't exist.
  */
 export const getScheduler = (): Scheduler => Scheduler.get()
-
-//* HMR Accept ==============================
-// Accept hot updates to preserve scheduler state
-if (hmrData) {
-  hmrData.accept?.()
-}

@@ -343,6 +343,8 @@ export interface GlobalJob {
 
 /**
  * Hot Module Replacement data structure for preserving scheduler state.
+ * @deprecated No longer read by the scheduler. The instance is kept on
+ * `globalThis` under a `Symbol.for` key, which already survives hot reloads.
  * @internal
  */
 export interface HMRData {

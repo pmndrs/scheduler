@@ -3,9 +3,8 @@ import { getScheduler } from '@pmndrs/scheduler'
 const box = document.getElementById('box')!
 const hud = document.getElementById('hud')!
 
+// No host renderer needed: the first register() creates an ambient root and starts the loop.
 const scheduler = getScheduler()
-// Run without any host renderer.
-scheduler.independent = true
 
 // Spin the box every frame (default 'update' phase).
 scheduler.register((state) => {

@@ -2141,3 +2141,207 @@ describe('Scheduler root ordering', () => {
     warn.mockRestore()
   })
 })
+
+//* Audit regressions ==============================
+// Each of these reproduced a real defect before its fix landed.
+
+describe('Scheduler audit regressions', () => {
+  beforeEach(() => {
+    Scheduler.reset()
+  })
+
+  afterEach(() => {
+    Scheduler.reset()
+    vi.unstubAllGlobals()
+  })
+
+  it('unsubscribe from register() still removes a job after a host adopted it', () => {
+    const scheduler = Scheduler.get()
+    scheduler.frameloop = 'never'
+    const cb = vi.fn()
+
+    // The unsubscribe closure used to pin the ambient root id; after adoption
+    // that root no longer existed, so the job leaked and kept running.
+    const unsubscribe = scheduler.register(cb, { id: 'orphan' })
+    expect(scheduler.getJobRootId('orphan')).toBe(Scheduler.AMBIENT_ID)
+
+    scheduler.registerRoot('host', { frameloop: 'never' })
+    expect(scheduler.getJobRootId('orphan')).toBe('host')
+
+    unsubscribe()
+    expect(scheduler.getJobIds()).not.toContain('orphan')
+    scheduler.step(0)
+    expect(cb).not.toHaveBeenCalled()
+  })
+
+  it('unsubscribe only removes the exact job it registered, not a later job reusing the id', () => {
+    const scheduler = Scheduler.get()
+    scheduler.frameloop = 'never'
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+
+    const first = vi.fn()
+    const second = vi.fn()
+    const unsubscribeFirst = scheduler.register(first, { id: 'shared' })
+    scheduler.register(second, { id: 'shared' }) // replaces, with a warning
+
+    unsubscribeFirst() // stale handle: must not remove the replacement
+    scheduler.step(0)
+    expect(second).toHaveBeenCalledTimes(1)
+    expect(scheduler.getJobIds()).toContain('shared')
+
+    warn.mockRestore()
+  })
+
+  it('keeps a single RAF loop when a callback stops and restarts the driver', () => {
+    const raf = createRafController()
+    const scheduler = Scheduler.get()
+    const ticks = vi.fn()
+    let restarted = false
+
+    scheduler.register(() => {
+      ticks()
+      if (restarted) return
+      restarted = true
+      scheduler.stop()
+      scheduler.start()
+    })
+
+    expect(raf.size).toBe(1)
+    raf.flush(0)
+    // The in-flight loop must not schedule a second frame beside the restart's.
+    expect(raf.size).toBe(1)
+    raf.flush(16)
+    expect(raf.size).toBe(1)
+    raf.flush(32)
+    expect(ticks).toHaveBeenCalledTimes(3)
+  })
+
+  it('keeps a single RAF loop when the last root is replaced inside a callback', () => {
+    const raf = createRafController()
+    const scheduler = Scheduler.get()
+    const ticks = vi.fn()
+    let swapped = false
+
+    const unregisterA = scheduler.registerRoot('a')
+    scheduler.register(
+      () => {
+        ticks()
+        if (swapped) return
+        swapped = true
+        unregisterA() // last root: driver stops
+        scheduler.registerRoot('b') // reconcile: driver restarts with a new RAF
+        scheduler.register(ticks, { rootId: 'b' })
+      },
+      { rootId: 'a' },
+    )
+
+    raf.flush(0)
+    expect(raf.size).toBe(1)
+    raf.flush(16)
+    expect(raf.size).toBe(1)
+    expect(ticks).toHaveBeenCalledTimes(2)
+  })
+
+  it('hands unthrottled jobs the shared frame state object and the exact root delta', () => {
+    const scheduler = Scheduler.get()
+    scheduler.frameloop = 'never'
+
+    let rootDelta = -1
+    let rootState: unknown = null
+    let allocations = 0
+    let deltaMismatches = 0
+
+    scheduler.register(
+      (state, delta) => {
+        rootDelta = delta
+        rootState = state
+      },
+      { priority: 1 },
+    )
+    scheduler.register((state, delta) => {
+      // Differencing accumulated time for every job made (a + d) - a !== d on
+      // most frames, so every unthrottled job got a fresh state copy each frame.
+      if (state !== rootState) allocations++
+      if (delta !== rootDelta) deltaMismatches++
+    })
+
+    let t = 0
+    for (let i = 0; i < 500; i++) {
+      t += 16.7 + (i % 3) * 0.37
+      scheduler.step(t)
+    }
+
+    expect(allocations).toBe(0)
+    expect(deltaMismatches).toBe(0)
+  })
+
+  it('still hands a throttled job its own interval', () => {
+    const scheduler = Scheduler.get()
+    scheduler.frameloop = 'never'
+    const deltas: number[] = []
+
+    scheduler.register((_state, delta) => deltas.push(delta), { fps: 30 })
+
+    for (let frame = 0; frame < 7; frame++) scheduler.step(1000 + frame * 16)
+
+    expect(deltas.length).toBeGreaterThan(1)
+    expect(deltas[1]).toBeCloseTo(0.048, 5)
+  })
+
+  it('runs a throttled job on its first frame regardless of timestamp magnitude', () => {
+    const scheduler = Scheduler.get()
+    scheduler.frameloop = 'never'
+    const cb = vi.fn()
+
+    scheduler.register(cb, { fps: 30 })
+    scheduler.step(0)
+    expect(cb).toHaveBeenCalledTimes(1)
+
+    scheduler.step(10)
+    expect(cb).toHaveBeenCalledTimes(1) // still throttled after that first run
+
+    scheduler.step(40)
+    expect(cb).toHaveBeenCalledTimes(2)
+  })
+
+  it('falls back to a timer driver when requestAnimationFrame is unavailable', () => {
+    vi.useFakeTimers()
+    vi.stubGlobal('requestAnimationFrame', undefined)
+    vi.stubGlobal('cancelAnimationFrame', undefined)
+
+    const scheduler = Scheduler.get()
+    const cb = vi.fn()
+
+    expect(() => scheduler.register(cb)).not.toThrow()
+    expect(scheduler.isRunning).toBe(true)
+
+    vi.advanceTimersByTime(50)
+    expect(cb).toHaveBeenCalled()
+
+    scheduler.stop()
+    const calls = cb.mock.calls.length
+    vi.advanceTimersByTime(50)
+    expect(cb).toHaveBeenCalledTimes(calls)
+
+    vi.useRealTimers()
+  })
+
+  it('warns when a job id is reused on a second root and keeps the id resolvable', () => {
+    const scheduler = Scheduler.get()
+    scheduler.frameloop = 'never'
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+
+    scheduler.registerRoot('a', { frameloop: 'never' })
+    scheduler.registerRoot('b', { frameloop: 'never' })
+    scheduler.register(() => {}, { id: 'dup', rootId: 'a' })
+    scheduler.register(() => {}, { id: 'dup', rootId: 'b' })
+
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining('already registered on root "a"'))
+    expect(scheduler.getJobRootId('dup')).toBe('b')
+
+    scheduler.unregister('dup', 'b')
+    expect(scheduler.getJobRootId('dup')).toBe('a')
+
+    warn.mockRestore()
+  })
+})

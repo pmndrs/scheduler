@@ -76,10 +76,14 @@ export function useFrame<T = FrameTimingState>(
   // Memoize callback ref (always points to latest callback)
   const callbackRef = useMutableCallback(callback)
 
+  // Presence, not identity: the ref tracks a changing callback without
+  // re-registering, but going from no callback to one (or back) must.
+  const hasCallback = !!callback
+
   // Subscribe on mount, unsubscribe on unmount (only if callback provided)
   useIsomorphicLayoutEffect(() => {
     // Skip registration if no callback - user just wants scheduler access
-    if (!callback) return
+    if (!hasCallback) return
 
     // Register immediately. Under the ambient-root model the scheduler always has
     // a root to attach to (the ambient root is created lazily here if none
@@ -92,7 +96,7 @@ export function useFrame<T = FrameTimingState>(
     })
     // Note: `callback` intentionally excluded - useMutableCallback handles updates
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [scheduler, id, optionsKey])
+  }, [scheduler, id, optionsKey, hasCallback])
 
   // Reactive isPaused via useSyncExternalStore --------------------------------
   const isPaused = React.useSyncExternalStore(

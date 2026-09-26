@@ -26,8 +26,17 @@ export function shouldRun(job: Job, now: number): boolean {
   // No FPS limit = always run
   if (!job.fps) return true
 
+  // First run (or first after a resume) always fires. Treating a missing
+  // lastRun as 0 made this depend on the timestamp's magnitude: RAF timestamps
+  // are large so it ran immediately in browsers, but under injected timestamps
+  // near zero the job silently sat out its first interval.
+  if (job.lastRun === undefined) {
+    job.lastRun = now
+    return true
+  }
+
   const minInterval = 1000 / job.fps
-  const lastRun = job.lastRun ?? 0
+  const lastRun = job.lastRun
   const elapsed = now - lastRun
 
   // Not enough time has passed (1ms tolerance for rAF timing jitter)
