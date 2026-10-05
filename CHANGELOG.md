@@ -1,6 +1,6 @@
 # Changelog
 
-//* Unreleased ===============================================================
+//* 0.3.0 — 2026-10-05 =======================================================
 
 - Added fixed-timestep phases. A phase with a `timestep` runs its jobs once per whole timestep banked from the root's clock — several times in a slow frame, bounded by `maxSubsteps` (default 8, surplus dropped) — each time with `delta === timestep`, jobs interleaved per substep, and `state.elapsed` as the phase's simulated time. `addPhase` takes `timestep` / `maxSubsteps`; `setPhaseTimestep`, `getPhaseTimestep`, and `getOverstep` are new. `state.overstep` (new field on `FrameTimingState`, in `[0, 1)`) is the interpolation fraction for rendering between substeps. `fps` is ignored in a fixed phase with a warning. Spec: `docs/superpowers/specs/2026-09-26-fixed-timestep-design.md`.
 - **Behavior change:** the default `physics` phase is now fixed at `1 / 60`. Jobs there receive `delta = 1 / 60` and may run more than once per frame; a hand-rolled accumulator inside a `physics` job should be removed. Call `setPhaseTimestep('physics', undefined)` to restore per-frame behavior.
